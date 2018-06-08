@@ -1,0 +1,10 @@
+//
+// Created by hx1997 on 2017/11/11.
+//
+
+#ifndef RIGHTSBOX_CPP_OSVERSIONUTILS_H
+#define RIGHTSBOX_CPP_OSVERSIONUTILS_H
+
+#include <VersionHelpers.h>
+
+#endif //RIGHTSBOX_CPP_OSVERSIONUTILS_H
