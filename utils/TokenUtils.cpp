@@ -19,10 +19,10 @@ BOOL IsAdmin() {
     return bIsAdmin;
 }
 
-DWORD SetTokenLowIL(HANDLE hToken) {
+static DWORD SetTokenIL(HANDLE hToken, LPCWSTR szIntegritySid) {
     PSID pIntegritySid;
 
-    if (!ConvertStringSidToSid(LOW_IL_STRING_SID, &pIntegritySid))
+    if (!ConvertStringSidToSid(szIntegritySid, &pIntegritySid))
         return GetLastError();
 
     TOKEN_MANDATORY_LABEL til = {};
@@ -30,12 +30,21 @@ DWORD SetTokenLowIL(HANDLE hToken) {
     til.Label.Attributes = SE_GROUP_INTEGRITY;
     til.Label.Sid = pIntegritySid;
 
+    DWORD fStatus = ERROR_SUCCESS;
     if (!SetTokenInformation(hToken, TokenIntegrityLevel, &til, sizeof(til)))
-        return GetLastError();
+        fStatus = GetLastError();
 
     LocalFree(pIntegritySid);
 
-    return ERROR_SUCCESS;
+    return fStatus;
+}
+
+DWORD SetTokenLowIL(HANDLE hToken) {
+    return SetTokenIL(hToken, LOW_IL_STRING_SID);
+}
+
+DWORD SetTokenMediumIL(HANDLE hToken) {
+    return SetTokenIL(hToken, MEDIUM_IL_STRING_SID);
 }
 
 DWORD GetTokenInfo(HANDLE hToken, void* &InfoBuff) {
@@ -59,7 +68,63 @@ DWORD GetTokenInfo(HANDLE hToken, void* &InfoBuff) {
     return ERROR_SUCCESS;
 }
 
-// TODO: Split into smaller functions
+// Builds the deny-only SID list from token groups; also extracts the Logon ID SID.
+// All groups except Logon ID, Everyone, Users, and INTERACTIVE are added to SidsToDelete.
+static void BuildSidsToDelete(PTOKEN_GROUPS pTokenGrps, SID_AND_ATTRIBUTES *SidsToDelete,
+                              DWORD &dwSids, PSID &pLogonIdSid) {
+    LPWSTR StringSid;
+
+    for (unsigned int i = 0; i < pTokenGrps->GroupCount; i++) {
+        if (IsValidSid(pTokenGrps->Groups[i].Sid)) {
+            if (ConvertSidToStringSid(pTokenGrps->Groups[i].Sid, &StringSid)) {
+                if (SE_GROUP_LOGON_ID == (pTokenGrps->Groups[i].Attributes & SE_GROUP_LOGON_ID)) {
+                    pLogonIdSid = pTokenGrps->Groups[i].Sid;
+                } else if ((lstrcmp(StringSid, EVERYONE_STRING_SID) != 0)
+                           && (lstrcmp(StringSid, USERS_STRING_SID) != 0)
+                           && (lstrcmp(StringSid, INTERACTIVE_STRING_SID) != 0)) {
+                    SidsToDelete[dwSids].Sid = pTokenGrps->Groups[i].Sid;
+                    dwSids++;
+                }
+
+                LocalFree(StringSid);
+            }
+        }
+    }
+}
+
+// Sets the default DACL on hNewToken granting System, Administrators, and the Logon ID full control.
+static DWORD SetRestrictedTokenDacl(HANDLE hNewToken, PSID pLogonIdSid, PSID pAdminSid, PSID pSystemSid) {
+    DWORD dwAcl;
+    char buf[0x400];
+    auto pAcl = (PACL)buf;
+
+    TOKEN_DEFAULT_DACL TokenDacl = {};
+    TokenDacl.DefaultDacl = pAcl;
+
+    // Calculate ACL length
+    dwAcl = sizeof(ACL) + sizeof(ACCESS_ALLOWED_ACE) * 3 + (GetLengthSid(pLogonIdSid) - 4) +
+            (GetLengthSid(pAdminSid) - 4) + (GetLengthSid(pSystemSid) - 4) + 3;
+    dwAcl &= 0xFFFFFFFC;
+
+    if (!InitializeAcl(pAcl, dwAcl, ACL_REVISION))
+        return GetLastError();
+
+    // Allow full control for System, Administrators, and Logon ID
+    if (!AddAccessAllowedAce(pAcl, ACL_REVISION, GENERIC_ALL, pSystemSid))
+        return GetLastError();
+
+    if (!AddAccessAllowedAce(pAcl, ACL_REVISION, GENERIC_ALL, pAdminSid))
+        return GetLastError();
+
+    if (!AddAccessAllowedAce(pAcl, ACL_REVISION, GENERIC_ALL, pLogonIdSid))
+        return GetLastError();
+
+    if (!SetTokenInformation(hNewToken, TokenDefaultDacl, &TokenDacl, sizeof(TOKEN_DEFAULT_DACL)))
+        return GetLastError();
+
+    return ERROR_SUCCESS;
+}
+
 DWORD RestrictToken(HANDLE hToken, HANDLE &hNewToken, BOOL bWriteProtected) {
     DWORD fStatus;
     PTOKEN_GROUPS pTokenGrps;
@@ -70,26 +135,9 @@ DWORD RestrictToken(HANDLE hToken, HANDLE &hNewToken, BOOL bWriteProtected) {
     DWORD nGroupCount = pTokenGrps->GroupCount - 1;
     auto *SidsToDelete = new SID_AND_ATTRIBUTES[nGroupCount];
     DWORD dwSids = 0;
-    LPWSTR StringSid;
-
     PSID pLogonIdSid = nullptr;
 
-    // Label deny-only for all groups except Logon ID, Everyone, Users, and INTERACTIVE
-    for (unsigned int i = 0; i < pTokenGrps->GroupCount; i++) {
-        if (IsValidSid(pTokenGrps->Groups[i].Sid)) {
-            if (ConvertSidToStringSid(pTokenGrps->Groups[i].Sid, &StringSid)) {
-                // Is this SID the Logon ID?
-                if (SE_GROUP_LOGON_ID == (pTokenGrps->Groups[i].Attributes & SE_GROUP_LOGON_ID)) {
-                    pLogonIdSid = pTokenGrps->Groups[i].Sid;
-                } else if ((lstrcmp(StringSid, EVERYONE_STRING_SID) != 0)
-                           && (lstrcmp(StringSid, USERS_STRING_SID) != 0)
-                           && (lstrcmp(StringSid, INTERACTIVE_STRING_SID) != 0)) {
-                    SidsToDelete[dwSids].Sid = pTokenGrps->Groups[i].Sid;
-                    dwSids++;
-                }
-            }
-        }
-    }
+    BuildSidsToDelete(pTokenGrps, SidsToDelete, dwSids, pLogonIdSid);
 
     PSID pAdminSid, pSystemSid, pRestrictedSid, pUsersSid, pEveryoneSid;
 
@@ -121,45 +169,8 @@ DWORD RestrictToken(HANDLE hToken, HANDLE &hNewToken, BOOL bWriteProtected) {
     if (!CreateRestrictedToken(hToken, dwFlags, dwSids, SidsToDelete, 0, nullptr, 4, SidsToRestrict, &hNewToken))
         return GetLastError();
 
-    DWORD dwAcl;
-    char buf[0x400];
-    auto pAcl = (PACL)buf;
+    fStatus = SetRestrictedTokenDacl(hNewToken, pLogonIdSid, pAdminSid, pSystemSid);
 
-    TOKEN_DEFAULT_DACL TokenDacl = {};
-    TokenDacl.DefaultDacl = pAcl;
-
-    // Calculate ACL length
-    dwAcl = sizeof(ACL) + sizeof(ACCESS_ALLOWED_ACE) * 3 + (GetLengthSid(pLogonIdSid) - 4) +
-            (GetLengthSid(pAdminSid) - 4) + (GetLengthSid(pSystemSid) - 4) + 3;
-    dwAcl &= 0xFFFFFFFC;
-
-    if (!InitializeAcl(pAcl, dwAcl, ACL_REVISION)) {
-        fStatus = GetLastError();
-        goto Cleanup;
-    }
-
-    // Allow full control for System, Administrators, and Logon ID
-    if (!AddAccessAllowedAce(pAcl, ACL_REVISION, GENERIC_ALL, pSystemSid)) {
-        fStatus = GetLastError();
-        goto Cleanup;
-    }
-
-    if (!AddAccessAllowedAce(pAcl, ACL_REVISION, GENERIC_ALL, pAdminSid)) {
-        fStatus = GetLastError();
-        goto Cleanup;
-    }
-
-    if (!AddAccessAllowedAce(pAcl, ACL_REVISION, GENERIC_ALL, pLogonIdSid)) {
-        fStatus = GetLastError();
-        goto Cleanup;
-    }
-
-    if (!SetTokenInformation(hNewToken, TokenDefaultDacl, &TokenDacl, sizeof(TOKEN_DEFAULT_DACL))) {
-        fStatus = GetLastError();
-        goto Cleanup;
-    }
-
-    Cleanup:
     if (fStatus != ERROR_SUCCESS) CloseHandle(hNewToken);
     delete SidsToDelete;
 
