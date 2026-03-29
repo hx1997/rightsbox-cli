@@ -17,7 +17,7 @@ void PollCompletionPort(HANDLE hIocp) {
     DWORD dwPID;
     HANDLE hProcess;
     CHAR szPath[MAX_PATH] = "???";
-    DWORD dwSize = MAX_PATH;
+    DWORD dwSize;
 
     while(true) {
         if (!GetQueuedCompletionStatus(hIocp, &dwEvent, &lpCompKey, &lpOverlapped, 100))
@@ -28,28 +28,40 @@ void PollCompletionPort(HANDLE hIocp) {
                 IssueMessage("All processes have ended in the sandbox!", MSGTYPE_INFO);
                 break;
             case JOB_OBJECT_MSG_NEW_PROCESS:
-                dwPID = (DWORD)lpOverlapped;
+                dwPID = static_cast<DWORD>(reinterpret_cast<ULONG_PTR>(lpOverlapped));
                 hProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, dwPID);
-                QueryFullProcessImageNameA(hProcess, 0, szPath, &dwSize);
-                CloseHandle(hProcess);
+                lstrcpyA(szPath, "???");
+                dwSize = MAX_PATH;
+                if (hProcess) {
+                    QueryFullProcessImageNameA(hProcess, 0, szPath, &dwSize);
+                    CloseHandle(hProcess);
+                }
 
                 sprintf(msg, "Process run: [%ld] %s", dwPID, szPath);
                 IssueMessage(msg, MSGTYPE_INFO);
                 break;
             case JOB_OBJECT_MSG_EXIT_PROCESS:
-                dwPID = (DWORD)lpOverlapped;
+                dwPID = static_cast<DWORD>(reinterpret_cast<ULONG_PTR>(lpOverlapped));
                 hProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, dwPID);
-                QueryFullProcessImageNameA(hProcess, 0, szPath, &dwSize);
-                CloseHandle(hProcess);
+                lstrcpyA(szPath, "???");
+                dwSize = MAX_PATH;
+                if (hProcess) {
+                    QueryFullProcessImageNameA(hProcess, 0, szPath, &dwSize);
+                    CloseHandle(hProcess);
+                }
 
                 sprintf(msg, "Process exited: [%ld] %s", dwPID, szPath);
                 IssueMessage(msg, MSGTYPE_INFO);
                 break;
             case JOB_OBJECT_MSG_ABNORMAL_EXIT_PROCESS:
-                dwPID = (DWORD)lpOverlapped;
+                dwPID = static_cast<DWORD>(reinterpret_cast<ULONG_PTR>(lpOverlapped));
                 hProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, dwPID);
-                QueryFullProcessImageNameA(hProcess, 0, szPath, &dwSize);
-                CloseHandle(hProcess);
+                lstrcpyA(szPath, "???");
+                dwSize = MAX_PATH;
+                if (hProcess) {
+                    QueryFullProcessImageNameA(hProcess, 0, szPath, &dwSize);
+                    CloseHandle(hProcess);
+                }
 
                 sprintf(msg, "Process crashed: [%ld] %s", dwPID, szPath);
                 IssueMessage(msg, MSGTYPE_INFO);
