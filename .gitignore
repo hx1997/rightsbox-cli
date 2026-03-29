@@ -21,3 +21,6 @@ cmake_install.cmake
 
 # Unified staged output
 dist/
+
+# Local workspace files
+.vscode/
