@@ -1,2 +1,23 @@
-.idea/*
-cmake-build-debug/*
+.idea/
+.vs/
+
+# CMake/VS generated build directories
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+
+# MSVC and linker artifacts
+*.obj
+*.pdb
+*.idb
+*.ilk
+*.lib
+*.exp
+
+# Produced binaries
+*.exe
+*.dll
+
+# Unified staged output
+dist/
