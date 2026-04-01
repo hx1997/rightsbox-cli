@@ -19,65 +19,77 @@ typedef LONG NTSTATUS;
 #define STATUS_SUCCESS           ((NTSTATUS)0x00000000)
 #define STATUS_ACCESS_DENIED     ((NTSTATUS)0xC0000022)
 #define STATUS_OBJECT_NAME_NOT_FOUND ((NTSTATUS)0xC0000034)
+#define STATUS_UNSUCCESSFUL          ((NTSTATUS)0xC0000001)
 
+#ifndef NT_SUCCESS
+#define NT_SUCCESS(s) ((NTSTATUS)(s) >= 0)
+#endif
+
+// IoStatusBlock.Information values for file create/open
+#ifndef FILE_SUPERSEDED
+#define FILE_SUPERSEDED          0x00000000
+#endif
 #ifndef FILE_OPENED
 #define FILE_OPENED              0x00000001
+#endif
+#ifndef FILE_CREATED
+#define FILE_CREATED             0x00000002
+#endif
+#ifndef FILE_OVERWRITTEN
+#define FILE_OVERWRITTEN         0x00000003
+#endif
+#ifndef FILE_EXISTS
+#define FILE_EXISTS              0x00000004
+#endif
+#ifndef FILE_DOES_NOT_EXIST
+#define FILE_DOES_NOT_EXIST      0x00000005
 #endif
 
 #ifndef THREAD_CREATE_FLAGS_CREATE_SUSPENDED
 #define THREAD_CREATE_FLAGS_CREATE_SUSPENDED 0x00000001
 #endif
 
+// NT CreateDisposition values
 #ifndef FILE_SUPERSEDE
-#define FILE_SUPERSEDE 0x00000000
+#define FILE_SUPERSEDE    0x00000000
 #endif
-
 #ifndef FILE_OPEN
-#define FILE_OPEN 0x00000001
+#define FILE_OPEN         0x00000001
 #endif
-
 #ifndef FILE_CREATE
-#define FILE_CREATE 0x00000002
+#define FILE_CREATE       0x00000002
 #endif
-
 #ifndef FILE_OPEN_IF
-#define FILE_OPEN_IF 0x00000003
+#define FILE_OPEN_IF      0x00000003
 #endif
-
 #ifndef FILE_OVERWRITE
-#define FILE_OVERWRITE 0x00000004
+#define FILE_OVERWRITE    0x00000004
 #endif
-
 #ifndef FILE_OVERWRITE_IF
 #define FILE_OVERWRITE_IF 0x00000005
 #endif
 
+// NT CreateOptions values
 #ifndef FILE_WRITE_THROUGH
-#define FILE_WRITE_THROUGH 0x00000002
+#define FILE_WRITE_THROUGH          0x00000002
 #endif
-
 #ifndef FILE_SEQUENTIAL_ONLY
-#define FILE_SEQUENTIAL_ONLY 0x00000004
+#define FILE_SEQUENTIAL_ONLY        0x00000004
 #endif
-
 #ifndef FILE_NO_INTERMEDIATE_BUFFERING
 #define FILE_NO_INTERMEDIATE_BUFFERING 0x00000008
 #endif
-
 #ifndef FILE_RANDOM_ACCESS
-#define FILE_RANDOM_ACCESS 0x00000800
+#define FILE_RANDOM_ACCESS          0x00000800
 #endif
-
 #ifndef FILE_DELETE_ON_CLOSE
-#define FILE_DELETE_ON_CLOSE 0x00001000
+#define FILE_DELETE_ON_CLOSE        0x00001000
 #endif
-
 #ifndef FILE_OPEN_FOR_BACKUP_INTENT
 #define FILE_OPEN_FOR_BACKUP_INTENT 0x00004000
 #endif
-
 #ifndef FILE_OPEN_REPARSE_POINT
-#define FILE_OPEN_REPARSE_POINT 0x00200000
+#define FILE_OPEN_REPARSE_POINT     0x00200000
 #endif
 
 typedef struct _UNICODE_STRING {
@@ -110,7 +122,17 @@ typedef struct _KEY_VALUE_PARTIAL_INFORMATION {
     UCHAR Data[1];
 } KEY_VALUE_PARTIAL_INFORMATION, *PKEY_VALUE_PARTIAL_INFORMATION;
 
-// KEY_VALUE_INFORMATION_CLASS
+// FILE_NETWORK_OPEN_INFORMATION — used by NtQueryFullAttributesFile
+typedef struct _FILE_NETWORK_OPEN_INFORMATION {
+    LARGE_INTEGER CreationTime;
+    LARGE_INTEGER LastAccessTime;
+    LARGE_INTEGER LastWriteTime;
+    LARGE_INTEGER ChangeTime;
+    LARGE_INTEGER AllocationSize;
+    LARGE_INTEGER EndOfFile;
+    ULONG         FileAttributes;
+} FILE_NETWORK_OPEN_INFORMATION, *PFILE_NETWORK_OPEN_INFORMATION;
+
 #define KeyValuePartialInformation 2
 
 // ============================================================================
@@ -188,6 +210,17 @@ typedef NTSTATUS (NTAPI *pfnNtReadFile)(
     PIO_STATUS_BLOCK IoStatusBlock, PVOID Buffer, ULONG Length,
     PLARGE_INTEGER ByteOffset, PULONG Key);
 
+typedef NTSTATUS (NTAPI *pfnNtQueryObject)(
+    HANDLE Handle, ULONG ObjectInformationClass,
+    PVOID ObjectInformation, ULONG ObjectInformationLength,
+    PULONG ReturnLength);
+
+#define ObjectNameInformation 1
+
+typedef struct _HOOK_OBJECT_NAME_INFORMATION {
+    UNICODE_STRING Name;
+} HOOK_OBJECT_NAME_INFORMATION, *PHOOK_OBJECT_NAME_INFORMATION;
+
 // ============================================================================
 // Inline Hooking Engine
 // ============================================================================
@@ -211,33 +244,63 @@ void RemoveInlineHook(PVOID pTarget, const BYTE* pSavedBytes, DWORD dwPatchSize)
 // Broker Client (embedded in hook DLL)
 // ============================================================================
 
+// Result struct for QueryFile — mirrors QueryFileResponsePayload fields.
+struct BrokerFileInfo {
+    LONGLONG CreationTime;
+    LONGLONG LastAccessTime;
+    LONGLONG LastWriteTime;
+    LONGLONG ChangeTime;
+    LONGLONG AllocationSize;
+    LONGLONG EndOfFile;
+    ULONG    FileAttributes;
+};
+
 class HookBrokerClient {
 public:
     HookBrokerClient();
     ~HookBrokerClient();
 
     DWORD Connect();
-    void Disconnect();
+    void  Disconnect();
 
     DWORD Ping();
     DWORD Trace(const char* szMessage);
-    DWORD OpenFile(LPCWSTR szPath, DWORD dwDesiredAccess, DWORD dwShareMode,
-                   DWORD dwCreationDisposition, DWORD dwFlagsAndAttributes,
-                   HANDLE* phHandle);
-    DWORD DeleteFile(LPCWSTR szPath);
-    DWORD QueryFile(LPCWSTR szPath, DWORD* pdwAttributes, ULONGLONG* pullSize,
-                    FILETIME* pftCreation, FILETIME* pftLastWrite);
-    DWORD OpenRegKey(DWORD dwRootKey, LPCWSTR szSubKey, DWORD dwDesiredAccess,
-                     HANDLE* phHandle);
-    DWORD QueryRegValue(DWORD dwRootKey, LPCWSTR szSubKey, LPCWSTR szValueName,
-                        DWORD* pdwType, BYTE* pData, DWORD dwBufSize, DWORD* pdwDataSize);
-    DWORD WriteRegValue(DWORD dwRootKey, LPCWSTR szSubKey, LPCWSTR szValueName,
-                        DWORD dwType, const BYTE* pData, DWORD dwDataSize);
-    DWORD OpenProcess(DWORD dwDesiredAccess, DWORD dwTargetPid, HANDLE* phHandle);
+
+    // All path parameters are NT namespace paths (e.g. \??\C:\..., \Registry\Machine\...).
+    // ObjAttributes is the raw OBJECT_ATTRIBUTES::Attributes field from the hook call site.
+    // These methods return NTSTATUS — the exact value from BrokerResponseHeader::dwStatus,
+    // which the broker always populates with a valid NTSTATUS code.
+
+    NTSTATUS OpenFile(LPCWSTR szNtPath, ACCESS_MASK DesiredAccess,
+                      LONGLONG AllocationSize, ULONG FileAttributes,
+                      ULONG ShareAccess, ULONG CreateDisposition, ULONG CreateOptions,
+                      ULONG ObjAttributes,
+                      HANDLE* phHandle, ULONG_PTR* pInformation);
+
+    NTSTATUS DeleteFile(LPCWSTR szNtPath, ULONG ObjAttributes);
+
+    NTSTATUS QueryFile(LPCWSTR szNtPath, ULONG ObjAttributes, BrokerFileInfo* pInfo);
+
+    NTSTATUS OpenRegKey(LPCWSTR szNtPath, ULONG ObjAttributes,
+                        ACCESS_MASK DesiredAccess, ULONG OpenOptions, HANDLE* phHandle);
+
+    NTSTATUS CreateRegKey(LPCWSTR szNtPath, ULONG ObjAttributes,
+                          ACCESS_MASK DesiredAccess, ULONG TitleIndex,
+                          LPCWSTR szClass, ULONG CreateOptions,
+                          HANDLE* phHandle, ULONG* pDisposition);
+
+    NTSTATUS QueryRegValue(LPCWSTR szNtPath, ULONG ObjAttributes, LPCWSTR szValueName,
+                           DWORD* pdwType, BYTE* pData, DWORD dwBufSize, DWORD* pdwDataSize);
+
+    NTSTATUS WriteRegValue(LPCWSTR szNtPath, ULONG ObjAttributes, LPCWSTR szValueName,
+                           DWORD dwType, const BYTE* pData, DWORD dwDataSize);
+
+    NTSTATUS OpenProcess(DWORD dwDesiredAccess, DWORD dwTargetPid, HANDLE* phHandle);
 
 private:
     HANDLE m_hPipe;
     DWORD  m_dwNextRequestId;
+    CRITICAL_SECTION m_cs;
 
     DWORD Transact(const BYTE* pRequest, DWORD dwRequestSize,
                    BYTE* pResponse, DWORD dwResponseBufSize, DWORD& dwResponseSize);
@@ -251,7 +314,7 @@ extern HMODULE g_hModule;
 extern WCHAR   g_szHookDllPath[MAX_PATH];
 extern HookBrokerClient g_client;
 
-// Thread-local flag to prevent hook recursion
+// Thread-local flag to prevent hook recursion during broker pipe I/O
 extern __declspec(thread) BOOL g_bInBrokerCall;
 
 #endif // RIGHTSBOX_RBOXHOOK_H

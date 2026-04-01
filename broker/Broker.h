@@ -78,15 +78,13 @@ private:
                          BYTE* pResp, DWORD dwRespBufSize, DWORD& dwRespSize);
     DWORD HandleWriteReg(const BYTE* pPayload, DWORD dwPayloadSize, DWORD dwRequestId,
                          BYTE* pResp, DWORD dwRespBufSize, DWORD& dwRespSize);
+    DWORD HandleCreateReg(const BYTE* pPayload, DWORD dwPayloadSize, DWORD dwRequestId,
+                          DWORD dwCallerPid, BYTE* pResp, DWORD dwRespBufSize, DWORD& dwRespSize);
     DWORD HandleOpenProcess(const BYTE* pPayload, DWORD dwPayloadSize, DWORD dwRequestId,
                             DWORD dwCallerPid, BYTE* pResp, DWORD dwRespBufSize, DWORD& dwRespSize);
     DWORD HandleTrace(const BYTE* pPayload, DWORD dwPayloadSize, DWORD dwRequestId,
                       DWORD dwCallerPid, BYTE* pResp, DWORD dwRespBufSize, DWORD& dwRespSize);
 
-    // Helpers
-    BOOL ValidatePath(LPCWSTR szPath, WCHAR* szCanonical, DWORD cchCanonical);
-
-    static HKEY RootKeyFromId(DWORD dwRootKey);
 };
 
 #endif // RIGHTSBOX_BROKER_H

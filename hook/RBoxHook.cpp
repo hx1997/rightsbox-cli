@@ -45,6 +45,7 @@ static pfnNtCreateUserProcess    Original_NtCreateUserProcess = nullptr;
 static pfnNtResumeThread         Original_NtResumeThread = nullptr;
 static pfnNtWriteFile            Original_NtWriteFile = nullptr;
 static pfnNtReadFile             Original_NtReadFile = nullptr;
+static pfnNtQueryObject          s_NtQueryObject = nullptr;
 
 // Hook entries for cleanup
 static HookEntry g_hooks[16];
@@ -120,7 +121,7 @@ static HANDLE TakePendingChildByThread(HANDLE hThread) {
     for (int i = 0; i < MAX_PENDING_CHILDREN; ++i) {
         if (g_pendingChildren[i].hProcess && g_pendingChildren[i].dwThreadId == dwThreadId) {
             HANDLE hProcess = g_pendingChildren[i].hProcess;
-            g_pendingChildren[i].hProcess = nullptr;
+            g_pendingChildren[i].hProcess  = nullptr;
             g_pendingChildren[i].dwThreadId = 0;
             LeaveCriticalSection(&g_pendingChildrenLock);
             return hProcess;
@@ -132,98 +133,100 @@ static HANDLE TakePendingChildByThread(HANDLE hThread) {
 }
 
 // ============================================================================
-// NT Path Conversion
+// NT Path Extraction
 // ============================================================================
 
-static BOOL NtPathToWin32Path(POBJECT_ATTRIBUTES oa, LPWSTR szOut, DWORD cchOut) {
+// Extract the full NT path from an OBJECT_ATTRIBUTES into a null-terminated
+// buffer.  When RootDirectory is set (relative path), resolves the root name
+// and combines it with ObjectName.  bFileHandle controls the resolution strategy:
+// file handles use GetFinalPathNameByHandleW, registry handles use NtQueryObject.
+// Returns FALSE on overflow or unresolvable paths — the hook then falls back to
+// the original (denied) status, which is safe.
+
+static BOOL OaToNtPath(POBJECT_ATTRIBUTES oa, LPWSTR szOut, DWORD cchOut, BOOL bFileHandle) {
     if (!oa || !oa->ObjectName || !oa->ObjectName->Buffer)
         return FALSE;
 
-    LPCWSTR pPath = oa->ObjectName->Buffer;
-    USHORT nLen = oa->ObjectName->Length / sizeof(WCHAR);
+    USHORT nRelChars = oa->ObjectName->Length / sizeof(WCHAR);
 
-    // We only handle absolute paths with \??\ prefix for now.
-    // Relative paths (RootDirectory != NULL) would need NtQueryObject.
-    if (oa->RootDirectory)
+    if (!oa->RootDirectory) {
+        // Absolute path — just copy ObjectName
+        if (nRelChars == 0 || nRelChars >= cchOut)
+            return FALSE;
+        memcpy(szOut, oa->ObjectName->Buffer, nRelChars * sizeof(WCHAR));
+        szOut[nRelChars] = L'\0';
+        return TRUE;
+    }
+
+    // Relative path — resolve RootDirectory to get a full NT namespace path
+    WCHAR szRoot[MAX_PATH];
+    DWORD nRootChars = 0;
+
+    if (bFileHandle) {
+        // For file handles, GetFinalPathNameByHandleW returns \\?\C:\... which we
+        // convert to \??\C:\... (NT DosDevices prefix).
+        g_bInBrokerCall = TRUE;
+        DWORD len = GetFinalPathNameByHandleW(oa->RootDirectory, szRoot, MAX_PATH,
+                                               VOLUME_NAME_DOS);
+        g_bInBrokerCall = FALSE;
+
+        if (len == 0 || len >= MAX_PATH)
+            return FALSE;
+
+        // \\?\C:\path → \??\C:\path  (replace second backslash with '?')
+        if (len >= 4 && szRoot[0] == L'\\' && szRoot[1] == L'\\' &&
+            szRoot[2] == L'?' && szRoot[3] == L'\\') {
+            szRoot[1] = L'?';
+        }
+        nRootChars = len;
+    } else {
+        // For registry key handles, NtQueryObject(ObjectNameInformation) returns
+        // the full NT path: \REGISTRY\MACHINE\SOFTWARE\...
+        if (!s_NtQueryObject)
+            return FALSE;
+
+        BYTE buf[2048];
+        ULONG cbResult = 0;
+        g_bInBrokerCall = TRUE;
+        NTSTATUS status = s_NtQueryObject(oa->RootDirectory, ObjectNameInformation,
+                                           buf, sizeof(buf), &cbResult);
+        g_bInBrokerCall = FALSE;
+
+        if (status != 0)
+            return FALSE;
+
+        // OBJECT_NAME_INFORMATION starts with a UNICODE_STRING
+        auto* pName = reinterpret_cast<UNICODE_STRING*>(buf);
+        nRootChars = pName->Length / sizeof(WCHAR);
+        if (nRootChars == 0 || nRootChars >= MAX_PATH)
+            return FALSE;
+
+        memcpy(szRoot, pName->Buffer, nRootChars * sizeof(WCHAR));
+        szRoot[nRootChars] = L'\0';
+    }
+
+    // Combine: root + "\" + relative
+    BOOL needSep = (nRootChars > 0 && szRoot[nRootChars - 1] != L'\\' &&
+                    nRelChars > 0 && oa->ObjectName->Buffer[0] != L'\\');
+    DWORD totalChars = nRootChars + (needSep ? 1 : 0) + nRelChars;
+    if (totalChars >= cchOut)
         return FALSE;
 
-    // Convert NT UNC path to Win32 UNC path.
-    if (nLen >= 8 && _wcsnicmp(pPath, L"\\??\\UNC\\", 8) == 0) {
-        DWORD nWin32Len = nLen - 6;
-        if (nWin32Len >= cchOut)
-            return FALSE;
-
-        szOut[0] = L'\\';
-        szOut[1] = L'\\';
-        wcsncpy_s(szOut + 2, cchOut - 2, pPath + 8, nLen - 8);
-        return TRUE;
-    }
-
-    // Strip \??\ prefix -> Win32 path
-    if (nLen >= 4 && wcsncmp(pPath, L"\\??\\", 4) == 0) {
-        DWORD nWin32Len = nLen - 4;
-        if (nWin32Len >= cchOut) return FALSE;
-        wcsncpy_s(szOut, cchOut, pPath + 4, nWin32Len);
-        szOut[nWin32Len] = L'\0';
-        return TRUE;
-    }
-
-    // Convert NT UNC path under \DosDevices\ to Win32 UNC path.
-    if (nLen >= 16 && _wcsnicmp(pPath, L"\\DosDevices\\UNC\\", 16) == 0) {
-        DWORD nWin32Len = nLen - 14;
-        if (nWin32Len >= cchOut)
-            return FALSE;
-
-        szOut[0] = L'\\';
-        szOut[1] = L'\\';
-        wcsncpy_s(szOut + 2, cchOut - 2, pPath + 16, nLen - 16);
-        return TRUE;
-    }
-
-    // Strip \DosDevices\ prefix (equivalent to \??\)
-    if (nLen >= 12 && _wcsnicmp(pPath, L"\\DosDevices\\", 12) == 0) {
-        DWORD nWin32Len = nLen - 12;
-        if (nWin32Len >= cchOut) return FALSE;
-        wcsncpy_s(szOut, cchOut, pPath + 12, nWin32Len);
-        szOut[nWin32Len] = L'\0';
-        return TRUE;
-    }
-
-    return FALSE;
+    memcpy(szOut, szRoot, nRootChars * sizeof(WCHAR));
+    DWORD pos = nRootChars;
+    if (needSep) szOut[pos++] = L'\\';
+    memcpy(szOut + pos, oa->ObjectName->Buffer, nRelChars * sizeof(WCHAR));
+    szOut[pos + nRelChars] = L'\0';
+    return TRUE;
 }
 
-static BOOL NtRegPathToWin32(POBJECT_ATTRIBUTES oa, LPWSTR szSubKey, DWORD cchSubKey, DWORD* pdwRootKey) {
-    if (!oa || !oa->ObjectName || !oa->ObjectName->Buffer)
-        return FALSE;
-
-    // For relative registry paths, we can't easily resolve without RootDirectory handle info.
-    // Only handle absolute paths for now.
-    if (oa->RootDirectory)
-        return FALSE;
-
-    LPCWSTR pPath = oa->ObjectName->Buffer;
-    USHORT nLen = oa->ObjectName->Length / sizeof(WCHAR);
-
-    // \Registry\Machine\... -> HKLM
-    if (nLen > 18 && _wcsnicmp(pPath, L"\\Registry\\Machine\\", 18) == 0) {
-        *pdwRootKey = 0;
-        DWORD nSubLen = nLen - 18;
-        if (nSubLen >= cchSubKey) return FALSE;
-        wcsncpy_s(szSubKey, cchSubKey, pPath + 18, nSubLen);
-        szSubKey[nSubLen] = L'\0';
-        return TRUE;
-    }
-
-    // \Registry\User\... -> HKU
-    if (nLen > 15 && _wcsnicmp(pPath, L"\\Registry\\User\\", 15) == 0) {
-        *pdwRootKey = 3;
-        DWORD nSubLen = nLen - 15;
-        if (nSubLen >= cchSubKey) return FALSE;
-        wcsncpy_s(szSubKey, cchSubKey, pPath + 15, nSubLen);
-        szSubKey[nSubLen] = L'\0';
-        return TRUE;
-    }
-
+// Returns TRUE if the resolved NT path is a file-system path that the broker
+// can handle (\??\..., \DosDevices\...).  Device paths (\Device\CNG, etc.)
+// and other kernel object paths are not brokerable.
+static BOOL IsBrokerablePath(LPCWSTR szNtPath) {
+    if (!szNtPath) return FALSE;
+    if (_wcsnicmp(szNtPath, L"\\??\\", 4) == 0) return TRUE;
+    if (_wcsnicmp(szNtPath, L"\\DosDevices\\", 12) == 0) return TRUE;
     return FALSE;
 }
 
@@ -349,7 +352,8 @@ static DWORD InjectHookDllCrossArch(HANDLE hProcess) {
 
     DWORD dwExitCode = 0;
     GetExitCodeProcess(pi.hProcess, &dwExitCode);
-    HookTrace("InjectHookDllCrossArch helper exitCode=%lu helper=%ls crossDll=%ls", dwExitCode, szHelper, szCrossDll);
+    HookTrace("InjectHookDllCrossArch helper exitCode=%lu helper=%ls crossDll=%ls",
+              dwExitCode, szHelper, szCrossDll);
 
     CloseHandle(pi.hProcess);
     CloseHandle(pi.hThread);
@@ -381,46 +385,6 @@ static DWORD InjectHookDllForChild(HANDLE hProcess, const char* traceContext) {
 // Hooked Functions — File Operations
 // ============================================================================
 
-static DWORD MapNtDispositionToWin32(ULONG createDisposition) {
-    switch (createDisposition) {
-        case FILE_SUPERSEDE:
-            return CREATE_ALWAYS;
-        case FILE_OPEN:
-            return OPEN_EXISTING;
-        case FILE_CREATE:
-            return CREATE_NEW;
-        case FILE_OPEN_IF:
-            return OPEN_ALWAYS;
-        case FILE_OVERWRITE:
-            return TRUNCATE_EXISTING;
-        case FILE_OVERWRITE_IF:
-            return CREATE_ALWAYS;
-        default:
-            return OPEN_EXISTING;
-    }
-}
-
-static DWORD MapNtOptionsToWin32Flags(ULONG createOptions, ULONG fileAttributes) {
-    DWORD flags = fileAttributes ? fileAttributes : FILE_ATTRIBUTE_NORMAL;
-
-    if (createOptions & FILE_WRITE_THROUGH)
-        flags |= FILE_FLAG_WRITE_THROUGH;
-    if (createOptions & FILE_SEQUENTIAL_ONLY)
-        flags |= FILE_FLAG_SEQUENTIAL_SCAN;
-    if (createOptions & FILE_RANDOM_ACCESS)
-        flags |= FILE_FLAG_RANDOM_ACCESS;
-    if (createOptions & FILE_NO_INTERMEDIATE_BUFFERING)
-        flags |= FILE_FLAG_NO_BUFFERING;
-    if (createOptions & FILE_OPEN_REPARSE_POINT)
-        flags |= FILE_FLAG_OPEN_REPARSE_POINT;
-    if (createOptions & FILE_DELETE_ON_CLOSE)
-        flags |= FILE_FLAG_DELETE_ON_CLOSE;
-    if (createOptions & FILE_OPEN_FOR_BACKUP_INTENT)
-        flags |= FILE_FLAG_BACKUP_SEMANTICS;
-
-    return flags;
-}
-
 static NTSTATUS NTAPI Hook_NtCreateFile(
     PHANDLE FileHandle, ACCESS_MASK DesiredAccess,
     POBJECT_ATTRIBUTES ObjectAttributes, PIO_STATUS_BLOCK IoStatusBlock,
@@ -434,30 +398,37 @@ static NTSTATUS NTAPI Hook_NtCreateFile(
             IoStatusBlock, AllocationSize, FileAttributes, ShareAccess,
             CreateDisposition, CreateOptions, EaBuffer, EaLength);
 
-    NTSTATUS status = Original_NtCreateFile(FileHandle, DesiredAccess, ObjectAttributes,
-        IoStatusBlock, AllocationSize, FileAttributes, ShareAccess,
-        CreateDisposition, CreateOptions, EaBuffer, EaLength);
+    WCHAR szNtPath[MAX_PATH];
+    if (!OaToNtPath(ObjectAttributes, szNtPath, MAX_PATH, TRUE))
+        return Original_NtCreateFile(FileHandle, DesiredAccess, ObjectAttributes,
+            IoStatusBlock, AllocationSize, FileAttributes, ShareAccess,
+            CreateDisposition, CreateOptions, EaBuffer, EaLength);
 
-    if (status != STATUS_ACCESS_DENIED)
-        return status;
+    // Device paths (\Device\CNG, \Device\KsecDD, etc.) can't be brokered.
+    if (!IsBrokerablePath(szNtPath))
+        return Original_NtCreateFile(FileHandle, DesiredAccess, ObjectAttributes,
+            IoStatusBlock, AllocationSize, FileAttributes, ShareAccess,
+            CreateDisposition, CreateOptions, EaBuffer, EaLength);
 
-    WCHAR szWin32Path[MAX_PATH];
-    if (!NtPathToWin32Path(ObjectAttributes, szWin32Path, MAX_PATH))
-        return status;
-
-    DWORD win32Disposition = MapNtDispositionToWin32(CreateDisposition);
-    DWORD win32Flags = MapNtOptionsToWin32Flags(CreateOptions, FileAttributes);
-
+    // Note: EaBuffer/EaLength (extended attributes) are not forwarded to the
+    // broker.  EAs are rarely used by normal Win32 applications and cannot be
+    // easily serialized over the pipe protocol.  If the caller specified EAs,
+    // the brokered file will be created without them.
     HANDLE hBrokered = INVALID_HANDLE_VALUE;
-    DWORD brokerStatus = g_client.OpenFile(szWin32Path, DesiredAccess, ShareAccess,
-        win32Disposition, win32Flags, &hBrokered);
+    ULONG_PTR information = FILE_OPENED;
+    NTSTATUS brokerStatus = g_client.OpenFile(
+        szNtPath, DesiredAccess,
+        AllocationSize ? AllocationSize->QuadPart : 0LL,
+        FileAttributes, ShareAccess, CreateDisposition, CreateOptions,
+        ObjectAttributes->Attributes,
+        &hBrokered, &information);
 
-    if (brokerStatus != ERROR_SUCCESS)
-        return status;
+    if (!NT_SUCCESS(brokerStatus))
+        return brokerStatus;
 
     *FileHandle = hBrokered;
     IoStatusBlock->Status = STATUS_SUCCESS;
-    IoStatusBlock->Information = FILE_OPENED;
+    IoStatusBlock->Information = information;
     return STATUS_SUCCESS;
 }
 
@@ -466,34 +437,42 @@ static NTSTATUS NTAPI Hook_NtOpenFile(
     POBJECT_ATTRIBUTES ObjectAttributes, PIO_STATUS_BLOCK IoStatusBlock,
     ULONG ShareAccess, ULONG OpenOptions)
 {
+    // Avoid recursion from broker pipe operations
     if (g_bInBrokerCall)
         return Original_NtOpenFile(FileHandle, DesiredAccess, ObjectAttributes,
             IoStatusBlock, ShareAccess, OpenOptions);
+    
+    WCHAR szNtPath[MAX_PATH];
+    if (!OaToNtPath(ObjectAttributes, szNtPath, MAX_PATH, TRUE))
+        return Original_NtOpenFile(FileHandle, DesiredAccess, ObjectAttributes,
+            IoStatusBlock, ShareAccess, OpenOptions);
 
-    NTSTATUS status = Original_NtOpenFile(FileHandle, DesiredAccess, ObjectAttributes,
-        IoStatusBlock, ShareAccess, OpenOptions);
-
-    if (status != STATUS_ACCESS_DENIED)
-        return status;
-
-    WCHAR szWin32Path[MAX_PATH];
-    if (!NtPathToWin32Path(ObjectAttributes, szWin32Path, MAX_PATH))
-        return status;
+    // Device paths (\Device\CNG, \Device\KsecDD, etc.) can't be brokered.
+    if (!IsBrokerablePath(szNtPath))
+        return Original_NtOpenFile(FileHandle, DesiredAccess, ObjectAttributes,
+            IoStatusBlock, ShareAccess, OpenOptions);
 
     HANDLE hBrokered = INVALID_HANDLE_VALUE;
-    // NtOpenFile maps to OPEN_EXISTING (CreateDisposition = 3 in NT terms)
-    DWORD brokerStatus = g_client.OpenFile(szWin32Path, DesiredAccess, ShareAccess, OPEN_EXISTING, 0, &hBrokered);
+    ULONG_PTR information = FILE_OPENED;
+    // NtOpenFile is always FILE_OPEN disposition; OpenOptions maps to CreateOptions
+    NTSTATUS brokerStatus = g_client.OpenFile(
+        szNtPath, DesiredAccess,
+        0LL, 0,
+        ShareAccess, FILE_OPEN, OpenOptions,
+        ObjectAttributes->Attributes,
+        &hBrokered, &information);
 
-    if (brokerStatus != ERROR_SUCCESS)
-        return status;
+    if (!NT_SUCCESS(brokerStatus))
+        return brokerStatus;
 
     *FileHandle = hBrokered;
     IoStatusBlock->Status = STATUS_SUCCESS;
-    IoStatusBlock->Information = FILE_OPENED;
+    IoStatusBlock->Information = information;
     return STATUS_SUCCESS;
 }
 
 static NTSTATUS NTAPI Hook_NtDeleteFile(POBJECT_ATTRIBUTES ObjectAttributes) {
+    // Avoid recursion from broker pipe operations
     if (g_bInBrokerCall)
         return Original_NtDeleteFile(ObjectAttributes);
 
@@ -502,17 +481,18 @@ static NTSTATUS NTAPI Hook_NtDeleteFile(POBJECT_ATTRIBUTES ObjectAttributes) {
     if (status != STATUS_ACCESS_DENIED)
         return status;
 
-    WCHAR szWin32Path[MAX_PATH];
-    if (!NtPathToWin32Path(ObjectAttributes, szWin32Path, MAX_PATH))
+    WCHAR szNtPath[MAX_PATH];
+    if (!OaToNtPath(ObjectAttributes, szNtPath, MAX_PATH, TRUE))
         return status;
 
-    DWORD brokerStatus = g_client.DeleteFile(szWin32Path);
-    return (brokerStatus == ERROR_SUCCESS) ? STATUS_SUCCESS : status;
+    NTSTATUS brokerStatus = g_client.DeleteFile(szNtPath, ObjectAttributes->Attributes);
+    return NT_SUCCESS(brokerStatus) ? STATUS_SUCCESS : brokerStatus;
 }
 
 static NTSTATUS NTAPI Hook_NtQueryAttributesFile(
     POBJECT_ATTRIBUTES ObjectAttributes, PVOID FileInformation)
 {
+    // Avoid recursion from broker pipe operations
     if (g_bInBrokerCall)
         return Original_NtQueryAttributesFile(ObjectAttributes, FileInformation);
 
@@ -521,30 +501,33 @@ static NTSTATUS NTAPI Hook_NtQueryAttributesFile(
     if (status != STATUS_ACCESS_DENIED)
         return status;
 
-    WCHAR szWin32Path[MAX_PATH];
-    if (!NtPathToWin32Path(ObjectAttributes, szWin32Path, MAX_PATH))
+    WCHAR szNtPath[MAX_PATH];
+    if (!OaToNtPath(ObjectAttributes, szNtPath, MAX_PATH, TRUE))
         return status;
 
-    DWORD dwAttrs;
-    ULONGLONG ullSize;
-    FILETIME ftCreation, ftLastWrite;
-    DWORD brokerStatus = g_client.QueryFile(szWin32Path, &dwAttrs, &ullSize, &ftCreation, &ftLastWrite);
+    BrokerFileInfo info = {};
+    NTSTATUS brokerStatus = g_client.QueryFile(szNtPath, ObjectAttributes->Attributes, &info);
 
-    if (brokerStatus != ERROR_SUCCESS)
-        return status;
+    if (!NT_SUCCESS(brokerStatus))
+        return brokerStatus;
 
-    // Fill in FILE_BASIC_INFORMATION (the structure NtQueryAttributesFile returns)
-    // We only have attributes — set the struct minimally
+    // NtQueryAttributesFile output is FILE_BASIC_INFORMATION:
+    // CreationTime, LastAccessTime, LastWriteTime, ChangeTime (LARGE_INTEGER x4),
+    // FileAttributes (ULONG)
     auto* pBasicInfo = reinterpret_cast<FILE_BASIC_INFO*>(FileInformation);
     ZeroMemory(pBasicInfo, sizeof(FILE_BASIC_INFO));
-    pBasicInfo->FileAttributes = dwAttrs;
-
+    pBasicInfo->CreationTime.QuadPart   = info.CreationTime;
+    pBasicInfo->LastAccessTime.QuadPart = info.LastAccessTime;
+    pBasicInfo->LastWriteTime.QuadPart  = info.LastWriteTime;
+    pBasicInfo->ChangeTime.QuadPart     = info.ChangeTime;
+    pBasicInfo->FileAttributes          = info.FileAttributes;
     return STATUS_SUCCESS;
 }
 
 static NTSTATUS NTAPI Hook_NtQueryFullAttributesFile(
     POBJECT_ATTRIBUTES ObjectAttributes, PVOID FileInformation)
 {
+    // Avoid recursion from broker pipe operations
     if (g_bInBrokerCall)
         return Original_NtQueryFullAttributesFile(ObjectAttributes, FileInformation);
 
@@ -553,26 +536,25 @@ static NTSTATUS NTAPI Hook_NtQueryFullAttributesFile(
     if (status != STATUS_ACCESS_DENIED)
         return status;
 
-    WCHAR szWin32Path[MAX_PATH];
-    if (!NtPathToWin32Path(ObjectAttributes, szWin32Path, MAX_PATH))
+    WCHAR szNtPath[MAX_PATH];
+    if (!OaToNtPath(ObjectAttributes, szNtPath, MAX_PATH, TRUE))
         return status;
 
-    DWORD dwAttrs;
-    ULONGLONG ullSize;
-    FILETIME ftCreation, ftLastWrite;
-    DWORD brokerStatus = g_client.QueryFile(szWin32Path, &dwAttrs, &ullSize, &ftCreation, &ftLastWrite);
+    BrokerFileInfo info = {};
+    NTSTATUS brokerStatus = g_client.QueryFile(szNtPath, ObjectAttributes->Attributes, &info);
 
-    if (brokerStatus != ERROR_SUCCESS)
-        return status;
+    if (!NT_SUCCESS(brokerStatus))
+        return brokerStatus;
 
-    // FILE_NETWORK_OPEN_INFORMATION is the struct for NtQueryFullAttributesFile
-    // We fill what we have
-    ZeroMemory(FileInformation, 56); // sizeof(FILE_NETWORK_OPEN_INFORMATION)
-    auto* pDword = reinterpret_cast<DWORD*>((BYTE*)FileInformation + 48); // FileAttributes offset
-    *pDword = dwAttrs;
-    auto* pLargeInt = reinterpret_cast<LARGE_INTEGER*>((BYTE*)FileInformation + 32); // EndOfFile offset
-    pLargeInt->QuadPart = (LONGLONG)ullSize;
-
+    auto* pNetInfo = reinterpret_cast<FILE_NETWORK_OPEN_INFORMATION*>(FileInformation);
+    ZeroMemory(pNetInfo, sizeof(FILE_NETWORK_OPEN_INFORMATION));
+    pNetInfo->CreationTime.QuadPart   = info.CreationTime;
+    pNetInfo->LastAccessTime.QuadPart = info.LastAccessTime;
+    pNetInfo->LastWriteTime.QuadPart  = info.LastWriteTime;
+    pNetInfo->ChangeTime.QuadPart     = info.ChangeTime;
+    pNetInfo->AllocationSize.QuadPart = info.AllocationSize;
+    pNetInfo->EndOfFile.QuadPart      = info.EndOfFile;
+    pNetInfo->FileAttributes          = info.FileAttributes;
     return STATUS_SUCCESS;
 }
 
@@ -584,6 +566,7 @@ static NTSTATUS NTAPI Hook_NtOpenKey(
     PHANDLE KeyHandle, ACCESS_MASK DesiredAccess,
     POBJECT_ATTRIBUTES ObjectAttributes)
 {
+    // Avoid recursion from broker pipe operations
     if (g_bInBrokerCall)
         return Original_NtOpenKey(KeyHandle, DesiredAccess, ObjectAttributes);
 
@@ -592,16 +575,16 @@ static NTSTATUS NTAPI Hook_NtOpenKey(
     if (status != STATUS_ACCESS_DENIED)
         return status;
 
-    WCHAR szSubKey[MAX_PATH];
-    DWORD dwRootKey;
-    if (!NtRegPathToWin32(ObjectAttributes, szSubKey, MAX_PATH, &dwRootKey))
+    WCHAR szNtPath[MAX_PATH];
+    if (!OaToNtPath(ObjectAttributes, szNtPath, MAX_PATH, FALSE))
         return status;
 
     HANDLE hBrokered = nullptr;
-    DWORD brokerStatus = g_client.OpenRegKey(dwRootKey, szSubKey, DesiredAccess, &hBrokered);
+    NTSTATUS brokerStatus = g_client.OpenRegKey(szNtPath, ObjectAttributes->Attributes,
+                                              DesiredAccess, 0, &hBrokered);
 
-    if (brokerStatus != ERROR_SUCCESS)
-        return status;
+    if (!NT_SUCCESS(brokerStatus))
+        return brokerStatus;
 
     *KeyHandle = hBrokered;
     return STATUS_SUCCESS;
@@ -611,6 +594,7 @@ static NTSTATUS NTAPI Hook_NtOpenKeyEx(
     PHANDLE KeyHandle, ACCESS_MASK DesiredAccess,
     POBJECT_ATTRIBUTES ObjectAttributes, ULONG OpenOptions)
 {
+    // Avoid recursion from broker pipe operations
     if (g_bInBrokerCall)
         return Original_NtOpenKeyEx(KeyHandle, DesiredAccess, ObjectAttributes, OpenOptions);
 
@@ -619,16 +603,16 @@ static NTSTATUS NTAPI Hook_NtOpenKeyEx(
     if (status != STATUS_ACCESS_DENIED)
         return status;
 
-    WCHAR szSubKey[MAX_PATH];
-    DWORD dwRootKey;
-    if (!NtRegPathToWin32(ObjectAttributes, szSubKey, MAX_PATH, &dwRootKey))
+    WCHAR szNtPath[MAX_PATH];
+    if (!OaToNtPath(ObjectAttributes, szNtPath, MAX_PATH, FALSE))
         return status;
 
     HANDLE hBrokered = nullptr;
-    DWORD brokerStatus = g_client.OpenRegKey(dwRootKey, szSubKey, DesiredAccess, &hBrokered);
+    NTSTATUS brokerStatus = g_client.OpenRegKey(szNtPath, ObjectAttributes->Attributes,
+                                              DesiredAccess, OpenOptions, &hBrokered);
 
-    if (brokerStatus != ERROR_SUCCESS)
-        return status;
+    if (!NT_SUCCESS(brokerStatus))
+        return brokerStatus;
 
     *KeyHandle = hBrokered;
     return STATUS_SUCCESS;
@@ -639,6 +623,7 @@ static NTSTATUS NTAPI Hook_NtCreateKey(
     POBJECT_ATTRIBUTES ObjectAttributes, ULONG TitleIndex,
     PUNICODE_STRING Class, ULONG CreateOptions, PULONG Disposition)
 {
+    // Avoid recursion from broker pipe operations
     if (g_bInBrokerCall)
         return Original_NtCreateKey(KeyHandle, DesiredAccess, ObjectAttributes,
             TitleIndex, Class, CreateOptions, Disposition);
@@ -649,32 +634,46 @@ static NTSTATUS NTAPI Hook_NtCreateKey(
     if (status != STATUS_ACCESS_DENIED)
         return status;
 
-    WCHAR szSubKey[MAX_PATH];
-    DWORD dwRootKey;
-    if (!NtRegPathToWin32(ObjectAttributes, szSubKey, MAX_PATH, &dwRootKey))
+    WCHAR szNtPath[MAX_PATH];
+    if (!OaToNtPath(ObjectAttributes, szNtPath, MAX_PATH, FALSE))
         return status;
+
+    // Extract Class string (usually NULL)
+    LPCWSTR szClass = nullptr;
+    WCHAR szClassBuf[256] = {};
+    if (Class && Class->Buffer && Class->Length > 0) {
+        USHORT nChars = Class->Length / sizeof(WCHAR);
+        if (nChars < _countof(szClassBuf)) {
+            memcpy(szClassBuf, Class->Buffer, nChars * sizeof(WCHAR));
+            szClassBuf[nChars] = L'\0';
+            szClass = szClassBuf;
+        }
+    }
 
     HANDLE hBrokered = nullptr;
-    DWORD brokerStatus = g_client.OpenRegKey(dwRootKey, szSubKey, DesiredAccess, &hBrokered);
+    ULONG disposition = 0;
+    NTSTATUS brokerStatus = g_client.CreateRegKey(szNtPath, ObjectAttributes->Attributes,
+                                                DesiredAccess, TitleIndex,
+                                                szClass, CreateOptions,
+                                                &hBrokered, &disposition);
 
-    if (brokerStatus != ERROR_SUCCESS)
-        return status;
+    if (!NT_SUCCESS(brokerStatus))
+        return brokerStatus;
 
     *KeyHandle = hBrokered;
-    if (Disposition) *Disposition = REG_OPENED_EXISTING_KEY;
+    if (Disposition) *Disposition = disposition;
     return STATUS_SUCCESS;
 }
 
-// NtQueryValueKey and NtSetValueKey operate on already-opened handles,
-// so if the handle was obtained through the broker, these calls succeed
-// without further brokering. We hook them only as a fallback.
+// NtQueryValueKey and NtSetValueKey operate on already-opened handles.
+// If the handle was obtained through the broker, these calls succeed without
+// further brokering.
 
 static NTSTATUS NTAPI Hook_NtQueryValueKey(
     HANDLE KeyHandle, PUNICODE_STRING ValueName,
     ULONG KeyValueInformationClass, PVOID KeyValueInformation,
     ULONG Length, PULONG ResultLength)
 {
-    // Pass through — the handle was already opened (possibly via broker)
     return Original_NtQueryValueKey(KeyHandle, ValueName, KeyValueInformationClass,
         KeyValueInformation, Length, ResultLength);
 }
@@ -698,6 +697,7 @@ static NTSTATUS NTAPI Hook_NtOpenProcess(
     PHANDLE ProcessHandle, ACCESS_MASK DesiredAccess,
     POBJECT_ATTRIBUTES ObjectAttributes, PVOID ClientId)
 {
+    // Avoid recursion from broker pipe operations
     if (g_bInBrokerCall)
         return Original_NtOpenProcess(ProcessHandle, DesiredAccess, ObjectAttributes, ClientId);
 
@@ -710,10 +710,10 @@ static NTSTATUS NTAPI Hook_NtOpenProcess(
     DWORD dwTargetPid = (DWORD)(ULONG_PTR)(((HANDLE*)ClientId)[0]);
 
     HANDLE hBrokered = nullptr;
-    DWORD brokerStatus = g_client.OpenProcess(DesiredAccess, dwTargetPid, &hBrokered);
+    NTSTATUS brokerStatus = g_client.OpenProcess(DesiredAccess, dwTargetPid, &hBrokered);
 
-    if (brokerStatus != ERROR_SUCCESS)
-        return status;
+    if (!NT_SUCCESS(brokerStatus))
+        return brokerStatus;
 
     *ProcessHandle = hBrokered;
     return STATUS_SUCCESS;
@@ -785,13 +785,13 @@ static NTSTATUS NTAPI Hook_NtCreateUserProcess(
 
 static NTSTATUS NTAPI Hook_NtResumeThread(HANDLE ThreadHandle, PULONG PreviousSuspendCount) {
     HANDLE hPendingProcess = TakePendingChildByThread(ThreadHandle);
-    HookTrace("NtResumeThread enter thread=%p pendingProcess=%p", ThreadHandle, hPendingProcess);
+    // HookTrace("NtResumeThread enter thread=%p pendingProcess=%p", ThreadHandle, hPendingProcess);
 
     if (hPendingProcess)
         InjectHookDllForChild(hPendingProcess, "NtResumeThread");
 
     NTSTATUS status = Original_NtResumeThread(ThreadHandle, PreviousSuspendCount);
-    HookTrace("NtResumeThread exit status=0x%08lX", status);
+    // HookTrace("NtResumeThread exit status=0x%08lX", status);
     return status;
 }
 
@@ -890,8 +890,8 @@ static BOOL InstallHook(const char* szName, PVOID pDetour, PVOID* ppOriginal) {
 
     HookEntry& entry = g_hooks[g_hookCount];
     entry.szFunctionName = szName;
-    entry.pOriginalFunc = pTarget;
-    entry.pDetourFunc = pDetour;
+    entry.pOriginalFunc  = pTarget;
+    entry.pDetourFunc    = pDetour;
 
     entry.pTrampoline = InstallInlineHook(pTarget, pDetour, entry.originalBytes, &entry.dwPatchSize);
     if (!entry.pTrampoline)
@@ -909,10 +909,13 @@ static BOOL InstallHook(const char* szName, PVOID pDetour, PVOID* ppOriginal) {
 HookBrokerClient::HookBrokerClient()
     : m_hPipe(INVALID_HANDLE_VALUE)
     , m_dwNextRequestId(1)
-{}
+{
+    InitializeCriticalSection(&m_cs);
+}
 
 HookBrokerClient::~HookBrokerClient() {
     Disconnect();
+    DeleteCriticalSection(&m_cs);
 }
 
 DWORD HookBrokerClient::Connect() {
@@ -958,11 +961,13 @@ DWORD HookBrokerClient::Transact(const BYTE* pRequest, DWORD dwRequestSize,
     if (m_hPipe == INVALID_HANDLE_VALUE)
         return ERROR_PIPE_NOT_CONNECTED;
 
+    EnterCriticalSection(&m_cs);
     g_bInBrokerCall = TRUE;
 
     DWORD dwBytesWritten = 0;
     if (!WriteFile(m_hPipe, pRequest, dwRequestSize, &dwBytesWritten, nullptr)) {
         g_bInBrokerCall = FALSE;
+        LeaveCriticalSection(&m_cs);
         return GetLastError();
     }
 
@@ -976,11 +981,13 @@ DWORD HookBrokerClient::Transact(const BYTE* pRequest, DWORD dwRequestSize,
 
         if (!bSuccess && GetLastError() != ERROR_MORE_DATA) {
             g_bInBrokerCall = FALSE;
+            LeaveCriticalSection(&m_cs);
             return GetLastError();
         }
     } while (!bSuccess);
 
     g_bInBrokerCall = FALSE;
+    LeaveCriticalSection(&m_cs);
     dwResponseSize = dwTotalRead;
     return ERROR_SUCCESS;
 }
@@ -998,8 +1005,7 @@ DWORD HookBrokerClient::Ping() {
     DWORD fStatus = Transact(requestBuf, sizeof(requestBuf), responseBuf, sizeof(responseBuf), dwResponseSize);
     if (fStatus != ERROR_SUCCESS) return fStatus;
 
-    auto* pResp = reinterpret_cast<BrokerResponseHeader*>(responseBuf);
-    return pResp->dwStatus;
+    return reinterpret_cast<BrokerResponseHeader*>(responseBuf)->dwStatus;
 }
 
 DWORD HookBrokerClient::Trace(const char* szMessage) {
@@ -1007,8 +1013,8 @@ DWORD HookBrokerClient::Trace(const char* szMessage) {
         return ERROR_INVALID_PARAMETER;
 
     DWORD dwMessageBytes = static_cast<DWORD>(strlen(szMessage) + 1);
-    DWORD dwPayloadSize = offsetof(TraceRequestPayload, szMessage) + dwMessageBytes;
-    DWORD dwRequestSize = sizeof(BrokerMessageHeader) + dwPayloadSize;
+    DWORD dwPayloadSize  = offsetof(TraceRequestPayload, szMessage) + dwMessageBytes;
+    DWORD dwRequestSize  = sizeof(BrokerMessageHeader) + dwPayloadSize;
 
     BYTE requestBuf[BROKER_MAX_MESSAGE_SIZE];
     auto* pHeader = reinterpret_cast<BrokerMessageHeader*>(requestBuf);
@@ -1024,17 +1030,18 @@ DWORD HookBrokerClient::Trace(const char* szMessage) {
     BYTE responseBuf[sizeof(BrokerResponseHeader)];
     DWORD dwResponseSize = 0;
     DWORD fStatus = Transact(requestBuf, dwRequestSize, responseBuf, sizeof(responseBuf), dwResponseSize);
-    if (fStatus != ERROR_SUCCESS)
-        return fStatus;
+    if (fStatus != ERROR_SUCCESS) return fStatus;
 
     return reinterpret_cast<BrokerResponseHeader*>(responseBuf)->dwStatus;
 }
 
-DWORD HookBrokerClient::OpenFile(LPCWSTR szPath, DWORD dwDesiredAccess, DWORD dwShareMode,
-                                  DWORD dwCreationDisposition, DWORD dwFlagsAndAttributes,
-                                  HANDLE* phHandle) {
-    DWORD dwPathBytes = (lstrlenW(szPath) + 1) * sizeof(WCHAR);
-    DWORD dwPayloadSize = offsetof(OpenFileRequestPayload, szPath) + dwPathBytes;
+NTSTATUS HookBrokerClient::OpenFile(LPCWSTR szNtPath, ACCESS_MASK DesiredAccess,
+                                  LONGLONG AllocationSize, ULONG FileAttributes,
+                                  ULONG ShareAccess, ULONG CreateDisposition, ULONG CreateOptions,
+                                  ULONG ObjAttributes,
+                                  HANDLE* phHandle, ULONG_PTR* pInformation) {
+    DWORD dwPathBytes   = (lstrlenW(szNtPath) + 1) * sizeof(WCHAR);
+    DWORD dwPayloadSize = offsetof(OpenFileRequestPayload, szNtPath) + dwPathBytes;
     DWORD dwRequestSize = sizeof(BrokerMessageHeader) + dwPayloadSize;
 
     BYTE requestBuf[BROKER_MAX_MESSAGE_SIZE];
@@ -1045,27 +1052,37 @@ DWORD HookBrokerClient::OpenFile(LPCWSTR szPath, DWORD dwDesiredAccess, DWORD dw
     pHeader->dwProcessId = GetCurrentProcessId();
 
     auto* pPayload = reinterpret_cast<OpenFileRequestPayload*>(requestBuf + sizeof(BrokerMessageHeader));
-    pPayload->dwDesiredAccess = dwDesiredAccess;
-    pPayload->dwShareMode = dwShareMode;
-    pPayload->dwCreationDisposition = dwCreationDisposition;
-    pPayload->dwFlagsAndAttributes = dwFlagsAndAttributes;
+    pPayload->DesiredAccess     = DesiredAccess;
+    pPayload->AllocationSize    = AllocationSize;
+    pPayload->FileAttributes    = FileAttributes;
+    pPayload->ShareAccess       = ShareAccess;
+    pPayload->CreateDisposition = CreateDisposition;
+    pPayload->CreateOptions     = CreateOptions;
+    pPayload->ObjAttributes     = ObjAttributes;
     pPayload->dwPathLengthBytes = dwPathBytes;
-    memcpy(pPayload->szPath, szPath, dwPathBytes);
+    memcpy(pPayload->szNtPath, szNtPath, dwPathBytes);
 
     BYTE responseBuf[BROKER_MAX_MESSAGE_SIZE];
     DWORD dwResponseSize = 0;
     DWORD fStatus = Transact(requestBuf, dwRequestSize, responseBuf, sizeof(responseBuf), dwResponseSize);
-    if (fStatus != ERROR_SUCCESS) return fStatus;
+    if (fStatus != ERROR_SUCCESS) return (NTSTATUS)STATUS_UNSUCCESSFUL;
 
     auto* pResp = reinterpret_cast<BrokerResponseHeader*>(responseBuf);
-    if (pResp->dwStatus == ERROR_SUCCESS)
+    if (NT_SUCCESS((NTSTATUS)pResp->dwStatus)) {
         *phHandle = (HANDLE)pResp->dwHandle;
-    return pResp->dwStatus;
+        if (pInformation &&
+            dwResponseSize >= sizeof(BrokerResponseHeader) + sizeof(OpenFileResponsePayload)) {
+            auto* pRespPayload = reinterpret_cast<OpenFileResponsePayload*>(
+                responseBuf + sizeof(BrokerResponseHeader));
+            *pInformation = (ULONG_PTR)pRespPayload->Information;
+        }
+    }
+    return (NTSTATUS)pResp->dwStatus;
 }
 
-DWORD HookBrokerClient::DeleteFile(LPCWSTR szPath) {
-    DWORD dwPathBytes = (lstrlenW(szPath) + 1) * sizeof(WCHAR);
-    DWORD dwPayloadSize = offsetof(DeleteFileRequestPayload, szPath) + dwPathBytes;
+NTSTATUS HookBrokerClient::DeleteFile(LPCWSTR szNtPath, ULONG ObjAttributes) {
+    DWORD dwPathBytes   = (lstrlenW(szNtPath) + 1) * sizeof(WCHAR);
+    DWORD dwPayloadSize = offsetof(DeleteFileRequestPayload, szNtPath) + dwPathBytes;
     DWORD dwRequestSize = sizeof(BrokerMessageHeader) + dwPayloadSize;
 
     BYTE requestBuf[BROKER_MAX_MESSAGE_SIZE];
@@ -1076,21 +1093,21 @@ DWORD HookBrokerClient::DeleteFile(LPCWSTR szPath) {
     pHeader->dwProcessId = GetCurrentProcessId();
 
     auto* pPayload = reinterpret_cast<DeleteFileRequestPayload*>(requestBuf + sizeof(BrokerMessageHeader));
+    pPayload->ObjAttributes     = ObjAttributes;
     pPayload->dwPathLengthBytes = dwPathBytes;
-    memcpy(pPayload->szPath, szPath, dwPathBytes);
+    memcpy(pPayload->szNtPath, szNtPath, dwPathBytes);
 
     BYTE responseBuf[sizeof(BrokerResponseHeader)];
     DWORD dwResponseSize = 0;
     DWORD fStatus = Transact(requestBuf, dwRequestSize, responseBuf, sizeof(responseBuf), dwResponseSize);
-    if (fStatus != ERROR_SUCCESS) return fStatus;
+    if (fStatus != ERROR_SUCCESS) return (NTSTATUS)STATUS_UNSUCCESSFUL;
 
-    return reinterpret_cast<BrokerResponseHeader*>(responseBuf)->dwStatus;
+    return (NTSTATUS)reinterpret_cast<BrokerResponseHeader*>(responseBuf)->dwStatus;
 }
 
-DWORD HookBrokerClient::QueryFile(LPCWSTR szPath, DWORD* pdwAttributes, ULONGLONG* pullSize,
-                                   FILETIME* pftCreation, FILETIME* pftLastWrite) {
-    DWORD dwPathBytes = (lstrlenW(szPath) + 1) * sizeof(WCHAR);
-    DWORD dwPayloadSize = offsetof(QueryFileRequestPayload, szPath) + dwPathBytes;
+NTSTATUS HookBrokerClient::QueryFile(LPCWSTR szNtPath, ULONG ObjAttributes, BrokerFileInfo* pInfo) {
+    DWORD dwPathBytes   = (lstrlenW(szNtPath) + 1) * sizeof(WCHAR);
+    DWORD dwPayloadSize = offsetof(QueryFileRequestPayload, szNtPath) + dwPathBytes;
     DWORD dwRequestSize = sizeof(BrokerMessageHeader) + dwPayloadSize;
 
     BYTE requestBuf[BROKER_MAX_MESSAGE_SIZE];
@@ -1101,29 +1118,34 @@ DWORD HookBrokerClient::QueryFile(LPCWSTR szPath, DWORD* pdwAttributes, ULONGLON
     pHeader->dwProcessId = GetCurrentProcessId();
 
     auto* pPayload = reinterpret_cast<QueryFileRequestPayload*>(requestBuf + sizeof(BrokerMessageHeader));
+    pPayload->ObjAttributes     = ObjAttributes;
     pPayload->dwPathLengthBytes = dwPathBytes;
-    memcpy(pPayload->szPath, szPath, dwPathBytes);
+    memcpy(pPayload->szNtPath, szNtPath, dwPathBytes);
 
     BYTE responseBuf[BROKER_MAX_MESSAGE_SIZE];
     DWORD dwResponseSize = 0;
     DWORD fStatus = Transact(requestBuf, dwRequestSize, responseBuf, sizeof(responseBuf), dwResponseSize);
-    if (fStatus != ERROR_SUCCESS) return fStatus;
+    if (fStatus != ERROR_SUCCESS) return (NTSTATUS)STATUS_UNSUCCESSFUL;
 
     auto* pResp = reinterpret_cast<BrokerResponseHeader*>(responseBuf);
-    if (pResp->dwStatus == ERROR_SUCCESS && dwResponseSize >= sizeof(BrokerResponseHeader) + sizeof(QueryFileResponsePayload)) {
-        auto* pRespPayload = reinterpret_cast<QueryFileResponsePayload*>(responseBuf + sizeof(BrokerResponseHeader));
-        if (pdwAttributes) *pdwAttributes = pRespPayload->dwFileAttributes;
-        if (pullSize) *pullSize = pRespPayload->ullFileSize;
-        if (pftCreation) *pftCreation = pRespPayload->ftCreationTime;
-        if (pftLastWrite) *pftLastWrite = pRespPayload->ftLastWriteTime;
+    if (NT_SUCCESS((NTSTATUS)pResp->dwStatus) && pInfo &&
+        dwResponseSize >= sizeof(BrokerResponseHeader) + sizeof(QueryFileResponsePayload)) {
+        auto* p = reinterpret_cast<QueryFileResponsePayload*>(responseBuf + sizeof(BrokerResponseHeader));
+        pInfo->CreationTime   = p->CreationTime;
+        pInfo->LastAccessTime = p->LastAccessTime;
+        pInfo->LastWriteTime  = p->LastWriteTime;
+        pInfo->ChangeTime     = p->ChangeTime;
+        pInfo->AllocationSize = p->AllocationSize;
+        pInfo->EndOfFile      = p->EndOfFile;
+        pInfo->FileAttributes = p->FileAttributes;
     }
-    return pResp->dwStatus;
+    return (NTSTATUS)pResp->dwStatus;
 }
 
-DWORD HookBrokerClient::OpenRegKey(DWORD dwRootKey, LPCWSTR szSubKey, DWORD dwDesiredAccess,
-                                    HANDLE* phHandle) {
-    DWORD dwSubKeyBytes = (lstrlenW(szSubKey) + 1) * sizeof(WCHAR);
-    DWORD dwPayloadSize = offsetof(OpenRegRequestPayload, szSubKey) + dwSubKeyBytes;
+NTSTATUS HookBrokerClient::OpenRegKey(LPCWSTR szNtPath, ULONG ObjAttributes,
+                                    ACCESS_MASK DesiredAccess, ULONG OpenOptions, HANDLE* phHandle) {
+    DWORD dwPathBytes   = (lstrlenW(szNtPath) + 1) * sizeof(WCHAR);
+    DWORD dwPayloadSize = offsetof(OpenRegRequestPayload, szNtPath) + dwPathBytes;
     DWORD dwRequestSize = sizeof(BrokerMessageHeader) + dwPayloadSize;
 
     BYTE requestBuf[BROKER_MAX_MESSAGE_SIZE];
@@ -1134,28 +1156,29 @@ DWORD HookBrokerClient::OpenRegKey(DWORD dwRootKey, LPCWSTR szSubKey, DWORD dwDe
     pHeader->dwProcessId = GetCurrentProcessId();
 
     auto* pPayload = reinterpret_cast<OpenRegRequestPayload*>(requestBuf + sizeof(BrokerMessageHeader));
-    pPayload->dwRootKey = dwRootKey;
-    pPayload->dwDesiredAccess = dwDesiredAccess;
-    pPayload->dwSubKeyLengthBytes = dwSubKeyBytes;
-    memcpy(pPayload->szSubKey, szSubKey, dwSubKeyBytes);
+    pPayload->DesiredAccess     = DesiredAccess;
+    pPayload->ObjAttributes     = ObjAttributes;
+    pPayload->OpenOptions       = OpenOptions;
+    pPayload->dwPathLengthBytes = dwPathBytes;
+    memcpy(pPayload->szNtPath, szNtPath, dwPathBytes);
 
     BYTE responseBuf[sizeof(BrokerResponseHeader)];
     DWORD dwResponseSize = 0;
     DWORD fStatus = Transact(requestBuf, dwRequestSize, responseBuf, sizeof(responseBuf), dwResponseSize);
-    if (fStatus != ERROR_SUCCESS) return fStatus;
+    if (fStatus != ERROR_SUCCESS) return (NTSTATUS)STATUS_UNSUCCESSFUL;
 
     auto* pResp = reinterpret_cast<BrokerResponseHeader*>(responseBuf);
-    if (pResp->dwStatus == ERROR_SUCCESS)
+    if (NT_SUCCESS((NTSTATUS)pResp->dwStatus))
         *phHandle = (HANDLE)pResp->dwHandle;
-    return pResp->dwStatus;
+    return (NTSTATUS)pResp->dwStatus;
 }
 
-DWORD HookBrokerClient::QueryRegValue(DWORD dwRootKey, LPCWSTR szSubKey, LPCWSTR szValueName,
+NTSTATUS HookBrokerClient::QueryRegValue(LPCWSTR szNtPath, ULONG ObjAttributes, LPCWSTR szValueName,
                                        DWORD* pdwType, BYTE* pData, DWORD dwBufSize, DWORD* pdwDataSize) {
-    DWORD dwSubKeyBytes = (lstrlenW(szSubKey) + 1) * sizeof(WCHAR);
+    DWORD dwPathBytes      = (lstrlenW(szNtPath) + 1) * sizeof(WCHAR);
     DWORD dwValueNameBytes = (lstrlenW(szValueName) + 1) * sizeof(WCHAR);
-    DWORD dwPayloadSize = offsetof(QueryRegRequestPayload, szData) + dwSubKeyBytes + dwValueNameBytes;
-    DWORD dwRequestSize = sizeof(BrokerMessageHeader) + dwPayloadSize;
+    DWORD dwPayloadSize    = offsetof(QueryRegRequestPayload, szData) + dwPathBytes + dwValueNameBytes;
+    DWORD dwRequestSize    = sizeof(BrokerMessageHeader) + dwPayloadSize;
 
     BYTE requestBuf[BROKER_MAX_MESSAGE_SIZE];
     auto* pHeader = reinterpret_cast<BrokerMessageHeader*>(requestBuf);
@@ -1165,34 +1188,34 @@ DWORD HookBrokerClient::QueryRegValue(DWORD dwRootKey, LPCWSTR szSubKey, LPCWSTR
     pHeader->dwProcessId = GetCurrentProcessId();
 
     auto* pPayload = reinterpret_cast<QueryRegRequestPayload*>(requestBuf + sizeof(BrokerMessageHeader));
-    pPayload->dwRootKey = dwRootKey;
-    pPayload->dwSubKeyLengthBytes = dwSubKeyBytes;
+    pPayload->ObjAttributes          = ObjAttributes;
+    pPayload->dwPathLengthBytes      = dwPathBytes;
     pPayload->dwValueNameLengthBytes = dwValueNameBytes;
-    memcpy(pPayload->szData, szSubKey, dwSubKeyBytes);
-    memcpy((BYTE*)pPayload->szData + dwSubKeyBytes, szValueName, dwValueNameBytes);
+    memcpy(pPayload->szData, szNtPath, dwPathBytes);
+    memcpy((BYTE*)pPayload->szData + dwPathBytes, szValueName, dwValueNameBytes);
 
     BYTE responseBuf[BROKER_MAX_MESSAGE_SIZE];
     DWORD dwResponseSize = 0;
     DWORD fStatus = Transact(requestBuf, dwRequestSize, responseBuf, sizeof(responseBuf), dwResponseSize);
-    if (fStatus != ERROR_SUCCESS) return fStatus;
+    if (fStatus != ERROR_SUCCESS) return (NTSTATUS)STATUS_UNSUCCESSFUL;
 
     auto* pResp = reinterpret_cast<BrokerResponseHeader*>(responseBuf);
-    if (pResp->dwStatus == ERROR_SUCCESS) {
-        auto* pRespPayload = reinterpret_cast<QueryRegResponsePayload*>(responseBuf + sizeof(BrokerResponseHeader));
-        if (pdwType) *pdwType = pRespPayload->dwRegType;
-        if (pdwDataSize) *pdwDataSize = pRespPayload->dwDataSize;
-        if (pData && dwBufSize >= pRespPayload->dwDataSize)
-            memcpy(pData, pRespPayload->data, pRespPayload->dwDataSize);
+    if (NT_SUCCESS((NTSTATUS)pResp->dwStatus)) {
+        auto* p = reinterpret_cast<QueryRegResponsePayload*>(responseBuf + sizeof(BrokerResponseHeader));
+        if (pdwType)     *pdwType     = p->dwRegType;
+        if (pdwDataSize) *pdwDataSize = p->dwDataSize;
+        if (pData && dwBufSize >= p->dwDataSize)
+            memcpy(pData, p->data, p->dwDataSize);
     }
-    return pResp->dwStatus;
+    return (NTSTATUS)pResp->dwStatus;
 }
 
-DWORD HookBrokerClient::WriteRegValue(DWORD dwRootKey, LPCWSTR szSubKey, LPCWSTR szValueName,
+NTSTATUS HookBrokerClient::WriteRegValue(LPCWSTR szNtPath, ULONG ObjAttributes, LPCWSTR szValueName,
                                        DWORD dwType, const BYTE* pData, DWORD dwDataSize) {
-    DWORD dwSubKeyBytes = (lstrlenW(szSubKey) + 1) * sizeof(WCHAR);
+    DWORD dwPathBytes      = (lstrlenW(szNtPath) + 1) * sizeof(WCHAR);
     DWORD dwValueNameBytes = (lstrlenW(szValueName) + 1) * sizeof(WCHAR);
-    DWORD dwPayloadSize = offsetof(WriteRegRequestPayload, szData) + dwSubKeyBytes + dwValueNameBytes + dwDataSize;
-    DWORD dwRequestSize = sizeof(BrokerMessageHeader) + dwPayloadSize;
+    DWORD dwPayloadSize    = offsetof(WriteRegRequestPayload, szData) + dwPathBytes + dwValueNameBytes + dwDataSize;
+    DWORD dwRequestSize    = sizeof(BrokerMessageHeader) + dwPayloadSize;
 
     BYTE requestBuf[BROKER_MAX_MESSAGE_SIZE];
     auto* pHeader = reinterpret_cast<BrokerMessageHeader*>(requestBuf);
@@ -1202,27 +1225,72 @@ DWORD HookBrokerClient::WriteRegValue(DWORD dwRootKey, LPCWSTR szSubKey, LPCWSTR
     pHeader->dwProcessId = GetCurrentProcessId();
 
     auto* pPayload = reinterpret_cast<WriteRegRequestPayload*>(requestBuf + sizeof(BrokerMessageHeader));
-    pPayload->dwRootKey = dwRootKey;
-    pPayload->dwRegType = dwType;
-    pPayload->dwSubKeyLengthBytes = dwSubKeyBytes;
+    pPayload->ObjAttributes          = ObjAttributes;
+    pPayload->dwRegType              = dwType;
+    pPayload->dwPathLengthBytes      = dwPathBytes;
     pPayload->dwValueNameLengthBytes = dwValueNameBytes;
-    pPayload->dwDataSize = dwDataSize;
+    pPayload->dwDataSize             = dwDataSize;
     BYTE* pDest = (BYTE*)pPayload->szData;
-    memcpy(pDest, szSubKey, dwSubKeyBytes);
-    pDest += dwSubKeyBytes;
-    memcpy(pDest, szValueName, dwValueNameBytes);
-    pDest += dwValueNameBytes;
-    memcpy(pDest, pData, dwDataSize);
+    memcpy(pDest, szNtPath,    dwPathBytes);      pDest += dwPathBytes;
+    memcpy(pDest, szValueName, dwValueNameBytes); pDest += dwValueNameBytes;
+    memcpy(pDest, pData,       dwDataSize);
 
     BYTE responseBuf[sizeof(BrokerResponseHeader)];
     DWORD dwResponseSize = 0;
     DWORD fStatus = Transact(requestBuf, dwRequestSize, responseBuf, sizeof(responseBuf), dwResponseSize);
-    if (fStatus != ERROR_SUCCESS) return fStatus;
+    if (fStatus != ERROR_SUCCESS) return (NTSTATUS)STATUS_UNSUCCESSFUL;
 
-    return reinterpret_cast<BrokerResponseHeader*>(responseBuf)->dwStatus;
+    return (NTSTATUS)reinterpret_cast<BrokerResponseHeader*>(responseBuf)->dwStatus;
 }
 
-DWORD HookBrokerClient::OpenProcess(DWORD dwDesiredAccess, DWORD dwTargetPid, HANDLE* phHandle) {
+NTSTATUS HookBrokerClient::CreateRegKey(LPCWSTR szNtPath, ULONG ObjAttributes,
+                                      ACCESS_MASK DesiredAccess, ULONG TitleIndex,
+                                      LPCWSTR szClass, ULONG CreateOptions,
+                                      HANDLE* phHandle, ULONG* pDisposition) {
+    DWORD dwPathBytes  = (lstrlenW(szNtPath) + 1) * sizeof(WCHAR);
+    DWORD dwClassBytes = szClass ? (lstrlenW(szClass) + 1) * sizeof(WCHAR) : 0;
+    DWORD dwPayloadSize = offsetof(CreateRegRequestPayload, szData) + dwPathBytes + dwClassBytes;
+    DWORD dwRequestSize = sizeof(BrokerMessageHeader) + dwPayloadSize;
+
+    BYTE requestBuf[BROKER_MAX_MESSAGE_SIZE];
+    auto* pHeader = reinterpret_cast<BrokerMessageHeader*>(requestBuf);
+    pHeader->dwTotalSize = dwRequestSize;
+    pHeader->dwRequestId = m_dwNextRequestId++;
+    pHeader->dwOperation = BROKER_OP_CREATE_REG;
+    pHeader->dwProcessId = GetCurrentProcessId();
+
+    auto* pPayload = reinterpret_cast<CreateRegRequestPayload*>(requestBuf + sizeof(BrokerMessageHeader));
+    pPayload->DesiredAccess        = DesiredAccess;
+    pPayload->ObjAttributes        = ObjAttributes;
+    pPayload->TitleIndex           = TitleIndex;
+    pPayload->CreateOptions        = CreateOptions;
+    pPayload->dwPathLengthBytes    = dwPathBytes;
+    pPayload->dwClassLengthBytes   = dwClassBytes;
+    BYTE* pDest = (BYTE*)pPayload->szData;
+    memcpy(pDest, szNtPath, dwPathBytes);
+    pDest += dwPathBytes;
+    if (szClass && dwClassBytes > 0)
+        memcpy(pDest, szClass, dwClassBytes);
+
+    BYTE responseBuf[BROKER_MAX_MESSAGE_SIZE];
+    DWORD dwResponseSize = 0;
+    DWORD fStatus = Transact(requestBuf, dwRequestSize, responseBuf, sizeof(responseBuf), dwResponseSize);
+    if (fStatus != ERROR_SUCCESS) return (NTSTATUS)STATUS_UNSUCCESSFUL;
+
+    auto* pResp = reinterpret_cast<BrokerResponseHeader*>(responseBuf);
+    if (NT_SUCCESS((NTSTATUS)pResp->dwStatus)) {
+        *phHandle = (HANDLE)pResp->dwHandle;
+        if (pDisposition &&
+            dwResponseSize >= sizeof(BrokerResponseHeader) + sizeof(CreateRegResponsePayload)) {
+            auto* pRespPayload = reinterpret_cast<CreateRegResponsePayload*>(
+                responseBuf + sizeof(BrokerResponseHeader));
+            *pDisposition = pRespPayload->Disposition;
+        }
+    }
+    return (NTSTATUS)pResp->dwStatus;
+}
+
+NTSTATUS HookBrokerClient::OpenProcess(DWORD dwDesiredAccess, DWORD dwTargetPid, HANDLE* phHandle) {
     DWORD dwRequestSize = sizeof(BrokerMessageHeader) + sizeof(OpenProcessRequestPayload);
 
     BYTE requestBuf[sizeof(BrokerMessageHeader) + sizeof(OpenProcessRequestPayload)];
@@ -1233,18 +1301,18 @@ DWORD HookBrokerClient::OpenProcess(DWORD dwDesiredAccess, DWORD dwTargetPid, HA
     pHeader->dwProcessId = GetCurrentProcessId();
 
     auto* pPayload = reinterpret_cast<OpenProcessRequestPayload*>(requestBuf + sizeof(BrokerMessageHeader));
-    pPayload->dwDesiredAccess = dwDesiredAccess;
-    pPayload->dwTargetProcessId = dwTargetPid;
+    pPayload->dwDesiredAccess    = dwDesiredAccess;
+    pPayload->dwTargetProcessId  = dwTargetPid;
 
     BYTE responseBuf[sizeof(BrokerResponseHeader)];
     DWORD dwResponseSize = 0;
     DWORD fStatus = Transact(requestBuf, dwRequestSize, responseBuf, sizeof(responseBuf), dwResponseSize);
-    if (fStatus != ERROR_SUCCESS) return fStatus;
+    if (fStatus != ERROR_SUCCESS) return (NTSTATUS)STATUS_UNSUCCESSFUL;
 
     auto* pResp = reinterpret_cast<BrokerResponseHeader*>(responseBuf);
-    if (pResp->dwStatus == ERROR_SUCCESS)
+    if (NT_SUCCESS((NTSTATUS)pResp->dwStatus))
         *phHandle = (HANDLE)pResp->dwHandle;
-    return pResp->dwStatus;
+    return (NTSTATUS)pResp->dwStatus;
 }
 
 // ============================================================================
@@ -1253,32 +1321,33 @@ DWORD HookBrokerClient::OpenProcess(DWORD dwDesiredAccess, DWORD dwTargetPid, HA
 
 static void InstallAllHooks() {
     // File operations
-    InstallHook("NtCreateFile",           (PVOID)Hook_NtCreateFile,           (PVOID*)&Original_NtCreateFile);
-    InstallHook("NtOpenFile",             (PVOID)Hook_NtOpenFile,             (PVOID*)&Original_NtOpenFile);
-    InstallHook("NtDeleteFile",           (PVOID)Hook_NtDeleteFile,           (PVOID*)&Original_NtDeleteFile);
-    InstallHook("NtQueryAttributesFile",  (PVOID)Hook_NtQueryAttributesFile,  (PVOID*)&Original_NtQueryAttributesFile);
-    InstallHook("NtQueryFullAttributesFile", (PVOID)Hook_NtQueryFullAttributesFile, (PVOID*)&Original_NtQueryFullAttributesFile);
+    InstallHook("NtCreateFile",              (PVOID)Hook_NtCreateFile,              (PVOID*)&Original_NtCreateFile);
+    InstallHook("NtOpenFile",               (PVOID)Hook_NtOpenFile,               (PVOID*)&Original_NtOpenFile);
+    InstallHook("NtDeleteFile",             (PVOID)Hook_NtDeleteFile,             (PVOID*)&Original_NtDeleteFile);
+    InstallHook("NtQueryAttributesFile",    (PVOID)Hook_NtQueryAttributesFile,    (PVOID*)&Original_NtQueryAttributesFile);
+    InstallHook("NtQueryFullAttributesFile",(PVOID)Hook_NtQueryFullAttributesFile,(PVOID*)&Original_NtQueryFullAttributesFile);
 
     // Registry operations
-    InstallHook("NtOpenKey",              (PVOID)Hook_NtOpenKey,              (PVOID*)&Original_NtOpenKey);
-    InstallHook("NtOpenKeyEx",            (PVOID)Hook_NtOpenKeyEx,            (PVOID*)&Original_NtOpenKeyEx);
-    InstallHook("NtCreateKey",            (PVOID)Hook_NtCreateKey,            (PVOID*)&Original_NtCreateKey);
-    InstallHook("NtQueryValueKey",        (PVOID)Hook_NtQueryValueKey,        (PVOID*)&Original_NtQueryValueKey);
-    InstallHook("NtSetValueKey",          (PVOID)Hook_NtSetValueKey,          (PVOID*)&Original_NtSetValueKey);
-    InstallHook("NtDeleteKey",            (PVOID)Hook_NtDeleteKey,            (PVOID*)&Original_NtDeleteKey);
+    InstallHook("NtOpenKey",          (PVOID)Hook_NtOpenKey,          (PVOID*)&Original_NtOpenKey);
+    InstallHook("NtOpenKeyEx",        (PVOID)Hook_NtOpenKeyEx,        (PVOID*)&Original_NtOpenKeyEx);
+    InstallHook("NtCreateKey",        (PVOID)Hook_NtCreateKey,        (PVOID*)&Original_NtCreateKey);
+    InstallHook("NtQueryValueKey",    (PVOID)Hook_NtQueryValueKey,    (PVOID*)&Original_NtQueryValueKey);
+    InstallHook("NtSetValueKey",      (PVOID)Hook_NtSetValueKey,      (PVOID*)&Original_NtSetValueKey);
+    InstallHook("NtDeleteKey",        (PVOID)Hook_NtDeleteKey,        (PVOID*)&Original_NtDeleteKey);
 
     // Process operations
-    InstallHook("NtOpenProcess",          (PVOID)Hook_NtOpenProcess,          (PVOID*)&Original_NtOpenProcess);
+    InstallHook("NtOpenProcess",      (PVOID)Hook_NtOpenProcess,      (PVOID*)&Original_NtOpenProcess);
 
     // Subprocess propagation
-    InstallHook("NtCreateUserProcess",    (PVOID)Hook_NtCreateUserProcess,    (PVOID*)&Original_NtCreateUserProcess);
-    InstallHook("NtResumeThread",         (PVOID)Hook_NtResumeThread,         (PVOID*)&Original_NtResumeThread);
+    InstallHook("NtCreateUserProcess",(PVOID)Hook_NtCreateUserProcess,(PVOID*)&Original_NtCreateUserProcess);
+    InstallHook("NtResumeThread",     (PVOID)Hook_NtResumeThread,     (PVOID*)&Original_NtResumeThread);
 
-    // Note: we also resolve NtWriteFile and NtReadFile via GetProcAddress
-    // for the broker client to use, but don't hook them
+    // Resolve NtWriteFile/NtReadFile for broker pipe I/O (not hooked)
+    // Resolve NtQueryObject for RootDirectory path resolution (not hooked)
     HMODULE hNtdll = GetModuleHandleA("ntdll.dll");
     Original_NtWriteFile = (pfnNtWriteFile)GetProcAddress(hNtdll, "NtWriteFile");
-    Original_NtReadFile = (pfnNtReadFile)GetProcAddress(hNtdll, "NtReadFile");
+    Original_NtReadFile  = (pfnNtReadFile) GetProcAddress(hNtdll, "NtReadFile");
+    s_NtQueryObject      = (pfnNtQueryObject)GetProcAddress(hNtdll, "NtQueryObject");
 }
 
 static void RemoveAllHooks() {

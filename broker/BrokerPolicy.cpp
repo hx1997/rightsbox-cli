@@ -64,11 +64,9 @@ void BrokerPolicy::LoadDefaults() {
     // Allow ping unconditionally
     AddRule(BROKER_OP_PING, POLICY_ALLOW, L".*", FALSE);
 
-    // Allow file reads from user profile and Windows directories
-    AddRule(BROKER_OP_OPEN_FILE, POLICY_ALLOW, L"C:\\\\Users\\\\.*", FALSE);
-    AddRule(BROKER_OP_QUERY_FILE, POLICY_ALLOW, L"C:\\\\Users\\\\.*", FALSE);
-    AddRule(BROKER_OP_OPEN_FILE, POLICY_ALLOW, L"C:\\\\Windows\\\\.*", FALSE);
-    AddRule(BROKER_OP_QUERY_FILE, POLICY_ALLOW, L"C:\\\\Windows\\\\.*", FALSE);
+    // Allow file reads
+    AddRule(BROKER_OP_OPEN_FILE, POLICY_ALLOW, L".*", FALSE);
+    AddRule(BROKER_OP_QUERY_FILE, POLICY_ALLOW, L".*", FALSE);
 
     // Deny file deletion in Windows directory
     AddRule(BROKER_OP_DELETE_FILE, POLICY_DENY, L"C:\\\\Windows\\\\.*", FALSE);
