@@ -243,7 +243,7 @@ DWORD RunWithLowToken(HANDLE hToken, LPCWSTR szExePath, LPCWSTR szCmdLine, HANDL
     DWORD fStatus = 0;
     LPVOID pEnvironment = nullptr;
 
-    if ((fStatus = SetTokenMediumIL(hToken)) != ERROR_SUCCESS)
+    if ((fStatus = SetTokenLowIL(hToken)) != ERROR_SUCCESS)
         return fStatus;
 
     STARTUPINFO si = {};
