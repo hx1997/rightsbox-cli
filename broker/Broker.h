@@ -46,6 +46,7 @@ private:
 
     // --- Threading ---
     HANDLE m_hShutdownEvent;            // Manual-reset event, signaled to stop
+    HANDLE m_hListenerThread;          // Listener thread handle (joinable)
 
     // --- Policy ---
     BrokerPolicy m_policy;

@@ -236,6 +236,7 @@ Broker::Broker()
     , m_pSacl(nullptr)
     , m_pLogonIdSid(nullptr)
     , m_hShutdownEvent(nullptr)
+    , m_hListenerThread(nullptr)
 {
     ZeroMemory(m_szPipeName, sizeof(m_szPipeName));
     ZeroMemory(&m_sa, sizeof(m_sa));
@@ -315,6 +316,7 @@ DWORD Broker::Initialize(HANDLE hAdminToken) {
 
 DWORD Broker::Start() {
     std::thread listener(ListenerThreadProc, this);
+    m_hListenerThread = listener.native_handle();
     listener.detach();
 
     IssueMessage("Broker: Listener started", MSGTYPE_INFO);
@@ -324,14 +326,18 @@ DWORD Broker::Start() {
 DWORD Broker::Stop() {
     if (m_hShutdownEvent) {
         SetEvent(m_hShutdownEvent);
-        // Give threads time to notice and clean up
-        Sleep(500);
+        // Wait for listener thread to notice shutdown and exit
+        if (m_hListenerThread) {
+            WaitForSingleObject(m_hListenerThread, 3000);
+            CloseHandle(m_hListenerThread);
+            m_hListenerThread = nullptr;
+        }
     }
 
     if (m_hBrokerToken)   { CloseHandle(m_hBrokerToken); m_hBrokerToken = nullptr; }
-    if (m_pSD)            { LocalFree(m_pSD);   m_pSD = nullptr; }
     if (m_pDacl)          { LocalFree(m_pDacl); m_pDacl = nullptr; }
     if (m_pSacl)          { LocalFree(m_pSacl); m_pSacl = nullptr; }
+    if (m_pSD)            { LocalFree(m_pSD);   m_pSD = nullptr; }
     if (m_pLogonIdSid)    { LocalFree(m_pLogonIdSid); m_pLogonIdSid = nullptr; }
     if (m_hShutdownEvent) { CloseHandle(m_hShutdownEvent); m_hShutdownEvent = nullptr; }
 
@@ -581,6 +587,43 @@ void Broker::ListenerThreadProc(Broker* pBroker) {
         }
 
         CloseHandle(ov.hEvent);
+
+        // Verify client is running under the same LogonID SID (prevents pipe squatting)
+        BOOL bAuthOk = FALSE;
+        DWORD dwClientPid = 0;
+        if (GetNamedPipeClientProcessId(hPipe, &dwClientPid)) {
+            HANDLE hClientProc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, dwClientPid);
+            if (hClientProc) {
+                HANDLE hClientToken = nullptr;
+                if (OpenProcessToken(hClientProc, TOKEN_QUERY, &hClientToken)) {
+                    DWORD dwLogonIdAttrSize = 0;
+                    // Check if client has the LogonID group (same logon session as admin)
+                    if (GetTokenInformation(hClientToken, TokenGroups, nullptr, 0, &dwLogonIdAttrSize) ||
+                        GetLastError() == ERROR_INSUFFICIENT_BUFFER) {
+                        auto* pBuf = (PTOKEN_GROUPS)LocalAlloc(LPTR, dwLogonIdAttrSize);
+                        if (pBuf && GetTokenInformation(hClientToken, TokenGroups, pBuf, dwLogonIdAttrSize, &dwLogonIdAttrSize)) {
+                            for (DWORD i = 0; i < pBuf->GroupCount; i++) {
+                                if (EqualSid(pBuf->Groups[i].Sid, pBroker->m_pLogonIdSid)) {
+                                    bAuthOk = TRUE;
+                                    break;
+                                }
+                            }
+                        }
+                        if (pBuf) LocalFree(pBuf);
+                    }
+                    CloseHandle(hClientToken);
+                }
+                CloseHandle(hClientProc);
+            }
+        }
+
+        if (!bAuthOk) {
+            IssueMessage("Broker: Rejected unauthorized client", MSGTYPE_WARNING);
+            FlushFileBuffers(hPipe);
+            DisconnectNamedPipe(hPipe);
+            CloseHandle(hPipe);
+            continue;
+        }
 
         IssueMessage("Broker: Client connected", MSGTYPE_INFO);
 
