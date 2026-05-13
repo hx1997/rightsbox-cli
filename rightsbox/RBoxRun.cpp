@@ -194,14 +194,11 @@ DWORD Sandbox::RunSandboxed(LPCWSTR szPath, BOOL bDropRights) {
         }
 
         ResumeThread(hThread);
+        CloseHandle(hThread);
+        hThread = nullptr;
 
         this->sandboxProcess = hProcess;
         hProcess = nullptr;
-
-        if (hProcess)
-            CloseHandle(hProcess);
-        if (hThread)
-            CloseHandle(hThread);
     }
 
     Cleanup:
@@ -306,6 +303,11 @@ DWORD Sandbox::StopSandbox() {
 }
 
 DWORD Sandbox::Job::StopJob() {
+    if (this->hIocp) {
+        CloseHandle(this->hIocp);
+        this->hIocp = nullptr;
+    }
+
     TerminateJobObject(this->hJob, ERROR_SUCCESS);
     CloseHandle(this->hJob);
     this->hJob = nullptr;
@@ -326,11 +328,13 @@ DWORD Sandbox::Job::ConfineProcessToJob(HANDLE hProcess) {
 
     if (!AssignProcessToJobObject(this->hJob, hProcess)) {
         CloseHandle(this->hJob);
+        this->hJob = nullptr;
         return GetLastError();
     }
 
     if (!SetJobLimits(JOB_OBJECT_UILIMIT_EXITWINDOWS)) {
         CloseHandle(this->hJob);
+        this->hJob = nullptr;
         return GetLastError();
     }
 
@@ -395,8 +399,14 @@ DWORD InjectHookDll(HANDLE hProcess, LPCWSTR szDllPath) {
         return err;
     }
 
-    WaitForSingleObject(hThread, 5000);
+    DWORD dwWait = WaitForSingleObject(hThread, 5000);
+    DWORD dwExitCode = 0;
+    GetExitCodeThread(hThread, &dwExitCode);
     CloseHandle(hThread);
     VirtualFreeEx(hProcess, pRemoteBuf, 0, MEM_RELEASE);
+
+    if (dwWait != WAIT_OBJECT_0 || dwExitCode == 0)
+        return ERROR_DLL_INIT_FAILED;
+
     return ERROR_SUCCESS;
 }
