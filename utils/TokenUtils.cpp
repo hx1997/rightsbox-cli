@@ -11,8 +11,10 @@ BOOL IsAdmin() {
     if (!ConvertStringSidToSid(ADMIN_STRING_SID, &pAdminSid))
         return 0;
 
-    if (!CheckTokenMembership(nullptr, pAdminSid, &bIsAdmin))
+    if (!CheckTokenMembership(nullptr, pAdminSid, &bIsAdmin)) {
+        LocalFree(pAdminSid);
         return 0;
+    }
 
     LocalFree(pAdminSid);
 
@@ -106,6 +108,9 @@ static DWORD SetRestrictedTokenDacl(HANDLE hNewToken, PSID pLogonIdSid, PSID pAd
             (GetLengthSid(pAdminSid) - 4) + (GetLengthSid(pSystemSid) - 4) + 3;
     dwAcl &= 0xFFFFFFFC;
 
+    if (dwAcl > sizeof(buf))
+        return ERROR_INSUFFICIENT_BUFFER;
+
     if (!InitializeAcl(pAcl, dwAcl, ACL_REVISION))
         return GetLastError();
 
@@ -127,59 +132,73 @@ static DWORD SetRestrictedTokenDacl(HANDLE hNewToken, PSID pLogonIdSid, PSID pAd
 
 DWORD RestrictToken(HANDLE hToken, HANDLE &hNewToken, BOOL bWriteProtected) {
     DWORD fStatus;
-    PTOKEN_GROUPS pTokenGrps;
-
-    if ((fStatus = GetTokenInfo(hToken, (void*&)pTokenGrps)) != ERROR_SUCCESS)
-        return fStatus;
-
-    DWORD nGroupCount = pTokenGrps->GroupCount - 1;
-    auto *SidsToDelete = new SID_AND_ATTRIBUTES[nGroupCount];
-    DWORD dwSids = 0;
+    PTOKEN_GROUPS pTokenGrps = nullptr;
+    SID_AND_ATTRIBUTES *SidsToDelete = nullptr;
+    PSID pAdminSid = nullptr, pSystemSid = nullptr, pRestrictedSid = nullptr;
+    PSID pUsersSid = nullptr, pEveryoneSid = nullptr;
     PSID pLogonIdSid = nullptr;
 
-    BuildSidsToDelete(pTokenGrps, SidsToDelete, dwSids, pLogonIdSid);
+    if ((fStatus = GetTokenInfo(hToken, (void*&)pTokenGrps)) != ERROR_SUCCESS)
+        goto Cleanup;
 
-    PSID pAdminSid, pSystemSid, pRestrictedSid, pUsersSid, pEveryoneSid;
+    if (pTokenGrps->GroupCount == 0) {
+        fStatus = ERROR_NO_TOKEN;
+        goto Cleanup;
+    }
 
-    ConvertStringSidToSid(ADMIN_STRING_SID, &pAdminSid);
-    ConvertStringSidToSid(SYSTEM_STRING_SID, &pSystemSid);
-    ConvertStringSidToSid(RESTRICTED_STRING_SID, &pRestrictedSid);
-    ConvertStringSidToSid(USERS_STRING_SID, &pUsersSid);
-    ConvertStringSidToSid(EVERYONE_STRING_SID, &pEveryoneSid);
+    {
+        DWORD nGroupCount = pTokenGrps->GroupCount - 1;
+        SidsToDelete = new SID_AND_ATTRIBUTES[nGroupCount];
+    }
 
-    SID_AND_ATTRIBUTES SidsToRestrict[4] = {};
+    {
+        DWORD dwSids = 0;
+        BuildSidsToDelete(pTokenGrps, SidsToDelete, dwSids, pLogonIdSid);
 
-    // Restrict Everyone, Users, RESTRICTED, and Logon ID
-    SidsToRestrict[0].Sid = pEveryoneSid;
-    SidsToRestrict[1].Sid = pUsersSid;
-    SidsToRestrict[2].Sid = pRestrictedSid;
-    SidsToRestrict[3].Sid = pLogonIdSid;
+        ConvertStringSidToSid(ADMIN_STRING_SID, &pAdminSid);
+        ConvertStringSidToSid(SYSTEM_STRING_SID, &pSystemSid);
+        ConvertStringSidToSid(RESTRICTED_STRING_SID, &pRestrictedSid);
+        ConvertStringSidToSid(USERS_STRING_SID, &pUsersSid);
+        ConvertStringSidToSid(EVERYONE_STRING_SID, &pEveryoneSid);
 
-    DWORD dwFlags;
+        SID_AND_ATTRIBUTES SidsToRestrict[4] = {};
 
-    if (IsWindowsVistaOrGreater())
-        dwFlags = (bWriteProtected ?
-                   (DISABLE_MAX_PRIVILEGE | LUA_TOKEN | WRITE_RESTRICTED) :
-                   (DISABLE_MAX_PRIVILEGE | LUA_TOKEN));
-    else
-        dwFlags = (bWriteProtected ?
-                   (DISABLE_MAX_PRIVILEGE | LUA_TOKEN) :
-                   (DISABLE_MAX_PRIVILEGE));
+        // Restrict Everyone, Users, RESTRICTED, and Logon ID
+        SidsToRestrict[0].Sid = pEveryoneSid;
+        SidsToRestrict[1].Sid = pUsersSid;
+        SidsToRestrict[2].Sid = pRestrictedSid;
+        SidsToRestrict[3].Sid = pLogonIdSid;
 
-    if (!CreateRestrictedToken(hToken, dwFlags, dwSids, SidsToDelete, 0, nullptr, 4, SidsToRestrict, &hNewToken))
-        return GetLastError();
+        DWORD dwFlags;
 
-    fStatus = SetRestrictedTokenDacl(hNewToken, pLogonIdSid, pAdminSid, pSystemSid);
+        if (IsWindowsVistaOrGreater())
+            dwFlags = (bWriteProtected ?
+                       (DISABLE_MAX_PRIVILEGE | LUA_TOKEN | WRITE_RESTRICTED) :
+                       (DISABLE_MAX_PRIVILEGE | LUA_TOKEN));
+        else
+            dwFlags = (bWriteProtected ?
+                       (DISABLE_MAX_PRIVILEGE | LUA_TOKEN) :
+                       (DISABLE_MAX_PRIVILEGE));
 
-    if (fStatus != ERROR_SUCCESS) CloseHandle(hNewToken);
-    delete SidsToDelete;
+        if (!CreateRestrictedToken(hToken, dwFlags, dwSids, SidsToDelete, 0, nullptr, 4, SidsToRestrict, &hNewToken)) {
+            fStatus = GetLastError();
+            goto Cleanup;
+        }
 
-    LocalFree(pAdminSid);
-    LocalFree(pSystemSid);
-    LocalFree(pRestrictedSid);
-    LocalFree(pUsersSid);
-    LocalFree(pEveryoneSid);
-    LocalFree(pLogonIdSid);
+        fStatus = SetRestrictedTokenDacl(hNewToken, pLogonIdSid, pAdminSid, pSystemSid);
+
+        if (fStatus != ERROR_SUCCESS) CloseHandle(hNewToken);
+    }
+
+Cleanup:
+    if (SidsToDelete) delete SidsToDelete;
+    if (pTokenGrps) free(pTokenGrps);
+    if (pAdminSid) LocalFree(pAdminSid);
+    if (pSystemSid) LocalFree(pSystemSid);
+    if (pRestrictedSid) LocalFree(pRestrictedSid);
+    if (pUsersSid) LocalFree(pUsersSid);
+    if (pEveryoneSid) LocalFree(pEveryoneSid);
+    if (pLogonIdSid) LocalFree(pLogonIdSid);
 
     return fStatus;
 }
