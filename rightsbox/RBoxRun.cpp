@@ -15,7 +15,7 @@
 #include "RBoxMessage.h"
 
 // Forward declarations
-DWORD RunWithLowToken(HANDLE hToken, LPCWSTR szExePath, LPCWSTR szCmdLine, HANDLE &hProcess, HANDLE &hThread);
+DWORD RunWithMediumToken(HANDLE hToken, LPCWSTR szExePath, LPCWSTR szCmdLine, HANDLE &hProcess, HANDLE &hThread);
 DWORD InjectHookDll(HANDLE hProcess, LPCWSTR szDllPath);
 
 static void AppendQuotedArg(std::wstring &cmd, LPCWSTR arg) {
@@ -123,10 +123,12 @@ DWORD Sandbox::RunSandboxed(LPCWSTR szPath, BOOL bDropRights) {
             hToken = hNewToken;
         }
     } else {
-        if (!DuplicateTokenEx(hToken, 0, nullptr, SecurityAnonymous, TokenPrimary, &hToken)) {
+        if (!DuplicateTokenEx(hToken, 0, nullptr, SecurityAnonymous, TokenPrimary, &hNewToken)) {
             CloseHandle(hToken);
             return GetLastError();
         }
+        CloseHandle(hToken);
+        hToken = hNewToken;
     }
 
     {
@@ -160,7 +162,7 @@ DWORD Sandbox::RunSandboxed(LPCWSTR szPath, BOOL bDropRights) {
             AppendQuotedArg(runnerCmdLine, szPath);
         }
 
-        if ((fStatus = RunWithLowToken(hToken, szRunnerPath, runnerCmdLine.c_str(), hProcess, hThread)) != ERROR_SUCCESS) {
+        if ((fStatus = RunWithMediumToken(hToken, szRunnerPath, runnerCmdLine.c_str(), hProcess, hThread)) != ERROR_SUCCESS) {
             goto Cleanup;
         }
 
@@ -239,12 +241,21 @@ DWORD Sandbox::WaitForSandbox(DWORD &dwExitCode) {
     return ERROR_SUCCESS;
 }
 
-DWORD RunWithLowToken(HANDLE hToken, LPCWSTR szExePath, LPCWSTR szCmdLine, HANDLE &hProcess, HANDLE &hThread) {
+DWORD RunWithMediumToken(HANDLE hToken, LPCWSTR szExePath, LPCWSTR szCmdLine, HANDLE &hProcess, HANDLE &hThread) {
     DWORD fStatus = 0;
     LPVOID pEnvironment = nullptr;
 
-    if ((fStatus = SetTokenLowIL(hToken)) != ERROR_SUCCESS)
+    // Lower to medium IL. CreateRestrictedToken inherits the parent's high IL,
+    // so without this the sandboxed process would run at high IL — defeating the
+    // sandbox.
+    if ((fStatus = SetTokenMediumIL(hToken)) != ERROR_SUCCESS)
         return fStatus;
+
+    {
+        char msg[128];
+        sprintf(msg, "RunWithMediumToken: token set to medium IL");
+        IssueMessage(msg, MSGTYPE_INFO);
+    }
 
     STARTUPINFO si = {};
     PROCESS_INFORMATION pi = {};

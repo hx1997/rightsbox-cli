@@ -719,10 +719,6 @@ static NTSTATUS NTAPI Hook_NtOpenProcess(
     return STATUS_SUCCESS;
 }
 
-// ============================================================================
-// Hooked Functions — Subprocess Propagation
-// ============================================================================
-
 static NTSTATUS NTAPI Hook_NtCreateUserProcess(
     PHANDLE ProcessHandle, PHANDLE ThreadHandle,
     ACCESS_MASK ProcessDesiredAccess, ACCESS_MASK ThreadDesiredAccess,
@@ -748,11 +744,16 @@ static NTSTATUS NTAPI Hook_NtCreateUserProcess(
 
     BOOL bWasSuspended = (ThreadFlags & THREAD_CREATE_FLAGS_CREATE_SUSPENDED);
 
+    // Always create the child suspended so we can inject the hook DLL before
+    // any code runs.  If the caller didn't ask for suspension we'll resume
+    // the thread ourselves after injection.
+    ULONG ForcedThreadFlags = ThreadFlags | THREAD_CREATE_FLAGS_CREATE_SUSPENDED;
+
     NTSTATUS status = Original_NtCreateUserProcess(
         ProcessHandle, ThreadHandle,
         ProcessDesiredAccess, ThreadDesiredAccess,
         ProcessObjectAttributes, ThreadObjectAttributes,
-        ProcessFlags, ThreadFlags,
+        ProcessFlags, ForcedThreadFlags,
         ProcessParameters, CreateInfo, AttributeList);
 
     HookTrace("NtCreateUserProcess original returned status=0x%08lX process=%p thread=%p",
@@ -760,6 +761,12 @@ static NTSTATUS NTAPI Hook_NtCreateUserProcess(
 
     if (status != STATUS_SUCCESS)
         return status;
+
+    DWORD dwChildPid = 0;
+    if (ProcessHandle && *ProcessHandle)
+        dwChildPid = GetProcessId(*ProcessHandle);
+
+    HookTrace("NtCreateUserProcess: bWasSuspended=%d, pid=%lu", bWasSuspended ? 1 : 0, dwChildPid);
 
     BOOL pendingAdded = FALSE;
     if (bWasSuspended && ProcessHandle && ThreadHandle && *ProcessHandle && *ThreadHandle)
@@ -785,13 +792,17 @@ static NTSTATUS NTAPI Hook_NtCreateUserProcess(
 
 static NTSTATUS NTAPI Hook_NtResumeThread(HANDLE ThreadHandle, PULONG PreviousSuspendCount) {
     HANDLE hPendingProcess = TakePendingChildByThread(ThreadHandle);
-    // HookTrace("NtResumeThread enter thread=%p pendingProcess=%p", ThreadHandle, hPendingProcess);
 
-    if (hPendingProcess)
+    if (hPendingProcess) {
+        DWORD dwChildPid = GetProcessId(hPendingProcess);
+        HookTrace("NtResumeThread injecting into child pid=%lu", dwChildPid);
+
         InjectHookDllForChild(hPendingProcess, "NtResumeThread");
 
+        HookTrace("NtResumeThread injection done for child pid=%lu", dwChildPid);
+    }
+
     NTSTATUS status = Original_NtResumeThread(ThreadHandle, PreviousSuspendCount);
-    // HookTrace("NtResumeThread exit status=0x%08lX", status);
     return status;
 }
 
@@ -879,12 +890,21 @@ void RemoveInlineHook(PVOID pTarget, const BYTE* pSavedBytes, DWORD dwPatchSize)
 // Hook Installation Helper
 // ============================================================================
 
+static BOOL InstallHookFromModule(HMODULE hModule, const char* szName, PVOID pDetour, PVOID* ppOriginal);
+
 static BOOL InstallHook(const char* szName, PVOID pDetour, PVOID* ppOriginal) {
     HMODULE hNtdll = GetModuleHandleA("ntdll.dll");
     if (!hNtdll)
         return FALSE;
 
-    PVOID pTarget = (PVOID)GetProcAddress(hNtdll, szName);
+    return InstallHookFromModule(hNtdll, szName, pDetour, ppOriginal);
+}
+
+static BOOL InstallHookFromModule(HMODULE hModule, const char* szName, PVOID pDetour, PVOID* ppOriginal) {
+    if (!hModule)
+        return FALSE;
+
+    PVOID pTarget = (PVOID)GetProcAddress(hModule, szName);
     if (!pTarget)
         return FALSE;
 
@@ -1380,6 +1400,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD dwReason, LPVOID lpReserved) {
 
             // Install hooks
             InstallAllHooks();
+
             break;
 
         case DLL_PROCESS_DETACH:

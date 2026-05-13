@@ -35,6 +35,10 @@ int DispatchRunSandboxed(LPCWSTR szTargetPath) {
             char msg[128];
             sprintf(msg, "WaitForSandbox failed with error %lu", fStatus);
             IssueMessage(msg, MSGTYPE_ERROR);
+        } else {
+            char msg[128];
+            sprintf(msg, "Sandbox exited with code %lu (0x%08lX)", exitCode, exitCode);
+            IssueMessage(msg, MSGTYPE_INFO);
         }
     }
 
