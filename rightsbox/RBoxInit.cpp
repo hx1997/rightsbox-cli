@@ -3,6 +3,7 @@
 //
 
 #include <windows.h>
+#include <string>
 #include "utils/OSVersionUtils.h"
 #include "utils/TokenUtils.h"
 #include "RBoxMessage.h"
@@ -43,7 +44,18 @@ int RestartElevated() {
     if (!GetModuleFileName(nullptr, szModulePath, MAX_PATH))
         return -1;
 
-    if ((int)ShellExecute(nullptr, L"runas", szModulePath, nullptr, nullptr, SW_SHOWNORMAL) <= 32)
+    // Rebuild command line with all original arguments
+    std::wstring cmdLine;
+    for (int i = 1; i < __argc; i++) {
+        if (i > 1) cmdLine += L' ';
+        cmdLine += L'\"';
+        cmdLine += __wargv[i];
+        cmdLine += L'\"';
+    }
+
+    if ((int)ShellExecute(nullptr, L"runas", szModulePath,
+                          cmdLine.empty() ? nullptr : cmdLine.c_str(),
+                          nullptr, SW_SHOWNORMAL) <= 32)
         return -1;
 
     return 0;

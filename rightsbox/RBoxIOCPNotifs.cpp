@@ -2,7 +2,7 @@
 // Created by hx1997 on 2018/3/11.
 //
 
-#define BUFSIZE 256
+#define BUFSIZE 512
 #define MAX_TRACKED_PROCESSES 256
 
 #include <cstdio>
