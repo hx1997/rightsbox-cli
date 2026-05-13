@@ -269,7 +269,7 @@ DWORD RunWithMediumToken(HANDLE hToken, LPCWSTR szExePath, LPCWSTR szCmdLine, HA
 
     if (!CreateProcessAsUser(hToken, szExePath, szCmdBuf[0] ? szCmdBuf : nullptr,
                              nullptr, nullptr, false,
-                             CREATE_BREAKAWAY_FROM_JOB | CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT,
+                             CREATE_BREAKAWAY_FROM_JOB | CREATE_SUSPENDED | CREATE_NEW_CONSOLE | CREATE_UNICODE_ENVIRONMENT,
                              pEnvironment, nullptr, &si, &pi)) {
         fStatus = GetLastError();
         DestroyEnvironmentBlock(pEnvironment);
