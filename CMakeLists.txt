@@ -44,11 +44,24 @@ if (MSVC)
 endif()
 
 # Hook DLL — injected into sandboxed processes (arch-suffixed: RBoxHook64.dll or RBoxHook32.dll)
-add_library(RBoxHook SHARED hook/RBoxHook.cpp hook/RBoxHook.h broker/BrokerProtocol.h)
+set(MINHOOK_SOURCES
+    ${CMAKE_SOURCE_DIR}/third_party/minhook/src/buffer.c
+    ${CMAKE_SOURCE_DIR}/third_party/minhook/src/hook.c
+    ${CMAKE_SOURCE_DIR}/third_party/minhook/src/trampoline.c
+    ${CMAKE_SOURCE_DIR}/third_party/minhook/src/hde/hde32.c
+    ${CMAKE_SOURCE_DIR}/third_party/minhook/src/hde/hde64.c
+)
+
+add_library(RBoxHook SHARED hook/RBoxHook.cpp hook/RBoxHook.h broker/BrokerProtocol.h ${MINHOOK_SOURCES})
+
+# MinHook sources are C — compile as C, not C++
+set_source_files_properties(${MINHOOK_SOURCES} PROPERTIES LANGUAGE C)
 
 target_include_directories(RBoxHook PRIVATE
     ${CMAKE_SOURCE_DIR}/hook
     ${CMAKE_SOURCE_DIR}/broker
+    ${CMAKE_SOURCE_DIR}/third_party/minhook/include
+    ${CMAKE_SOURCE_DIR}/third_party/minhook/src
 )
 
 target_compile_definitions(RBoxHook PRIVATE WIN32 WINDOWS UNICODE _UNICODE _WIN32_WINNT=0x0600)

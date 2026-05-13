@@ -222,25 +222,6 @@ typedef struct _HOOK_OBJECT_NAME_INFORMATION {
 } HOOK_OBJECT_NAME_INFORMATION, *PHOOK_OBJECT_NAME_INFORMATION;
 
 // ============================================================================
-// Inline Hooking Engine
-// ============================================================================
-
-struct HookEntry {
-    const char* szFunctionName;     // e.g. "NtCreateFile"
-    PVOID       pOriginalFunc;      // Address in ntdll
-    PVOID       pDetourFunc;        // Our hook function
-    PVOID       pTrampoline;        // Trampoline buffer (allocated)
-    BYTE        originalBytes[32];  // Saved original bytes
-    DWORD       dwPatchSize;        // Number of bytes patched
-};
-
-// Install an inline hook. Returns the trampoline (callable original).
-PVOID InstallInlineHook(PVOID pTarget, PVOID pDetour, BYTE* pSavedBytes, DWORD* pdwPatchSize);
-
-// Remove an inline hook (restore original bytes).
-void RemoveInlineHook(PVOID pTarget, const BYTE* pSavedBytes, DWORD dwPatchSize);
-
-// ============================================================================
 // Broker Client (embedded in hook DLL)
 // ============================================================================
 

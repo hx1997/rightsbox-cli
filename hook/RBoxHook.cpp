@@ -3,6 +3,7 @@
 //
 
 #include "RBoxHook.h"
+#include "MinHook.h"
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
@@ -46,10 +47,6 @@ static pfnNtResumeThread         Original_NtResumeThread = nullptr;
 static pfnNtWriteFile            Original_NtWriteFile = nullptr;
 static pfnNtReadFile             Original_NtReadFile = nullptr;
 static pfnNtQueryObject          s_NtQueryObject = nullptr;
-
-// Hook entries for cleanup
-static HookEntry g_hooks[16];
-static DWORD g_hookCount = 0;
 
 static void HookTrace(const char* format, ...) {
     if (g_bInHookTrace)
@@ -807,122 +804,6 @@ static NTSTATUS NTAPI Hook_NtResumeThread(HANDLE ThreadHandle, PULONG PreviousSu
 }
 
 // ============================================================================
-// Inline Hooking Engine
-// ============================================================================
-
-PVOID InstallInlineHook(PVOID pTarget, PVOID pDetour, BYTE* pSavedBytes, DWORD* pdwPatchSize) {
-    if (!pTarget || !pDetour)
-        return nullptr;
-
-#ifdef _WIN64
-    // x64 ntdll Nt* exports are syscall stubs with a short conditional branch
-    // and syscall/int 0x2e fallback sequence. Copy the full 24-byte stub so the
-    // trampoline preserves whole instructions and keeps the relative branch
-    // target within the copied block.
-    const DWORD dwPatchSize = 24;
-#else
-    // x86: 5-byte relative jump: E9 <rel32>
-    const DWORD dwPatchSize = 5;
-#endif
-
-    *pdwPatchSize = dwPatchSize;
-
-    // Save original bytes
-    memcpy(pSavedBytes, pTarget, dwPatchSize);
-
-    // Allocate trampoline: original bytes + jump back
-    DWORD dwTrampolineSize = dwPatchSize + 14; // Max jump size
-    PVOID pTrampoline = VirtualAlloc(nullptr, dwTrampolineSize,
-                                     MEM_COMMIT | MEM_RESERVE,
-                                     PAGE_EXECUTE_READWRITE);
-    if (!pTrampoline)
-        return nullptr;
-
-    // Copy original bytes to trampoline
-    memcpy(pTrampoline, pSavedBytes, dwPatchSize);
-
-    // Write jump-back from trampoline to original+N
-    BYTE* pTrampolineJump = (BYTE*)pTrampoline + dwPatchSize;
-    BYTE* pOriginalContinue = (BYTE*)pTarget + dwPatchSize;
-
-#ifdef _WIN64
-    // JMP [RIP+0] followed by 8-byte address
-    pTrampolineJump[0] = 0xFF;
-    pTrampolineJump[1] = 0x25;
-    *(DWORD*)(pTrampolineJump + 2) = 0; // RIP-relative offset = 0
-    *(UINT64*)(pTrampolineJump + 6) = (UINT64)pOriginalContinue;
-#else
-    pTrampolineJump[0] = 0xE9;
-    *(DWORD*)(pTrampolineJump + 1) = (DWORD)((BYTE*)pOriginalContinue - (pTrampolineJump + 5));
-#endif
-
-    // Now overwrite the target function with a jump to our detour
-    DWORD dwOldProtect;
-    VirtualProtect(pTarget, dwPatchSize, PAGE_EXECUTE_READWRITE, &dwOldProtect);
-
-#ifdef _WIN64
-    // MOV RAX, <detour address>; JMP RAX
-    BYTE* p = (BYTE*)pTarget;
-    p[0] = 0x48; p[1] = 0xB8;
-    *(UINT64*)(p + 2) = (UINT64)pDetour;
-    p[10] = 0xFF; p[11] = 0xE0;
-#else
-    BYTE* p = (BYTE*)pTarget;
-    p[0] = 0xE9;
-    *(DWORD*)(p + 1) = (DWORD)((BYTE*)pDetour - (p + 5));
-#endif
-
-    VirtualProtect(pTarget, dwPatchSize, dwOldProtect, &dwOldProtect);
-    FlushInstructionCache(GetCurrentProcess(), pTarget, dwPatchSize);
-
-    return pTrampoline;
-}
-
-void RemoveInlineHook(PVOID pTarget, const BYTE* pSavedBytes, DWORD dwPatchSize) {
-    DWORD dwOldProtect;
-    VirtualProtect(pTarget, dwPatchSize, PAGE_EXECUTE_READWRITE, &dwOldProtect);
-    memcpy(pTarget, pSavedBytes, dwPatchSize);
-    VirtualProtect(pTarget, dwPatchSize, dwOldProtect, &dwOldProtect);
-    FlushInstructionCache(GetCurrentProcess(), pTarget, dwPatchSize);
-}
-
-// ============================================================================
-// Hook Installation Helper
-// ============================================================================
-
-static BOOL InstallHookFromModule(HMODULE hModule, const char* szName, PVOID pDetour, PVOID* ppOriginal);
-
-static BOOL InstallHook(const char* szName, PVOID pDetour, PVOID* ppOriginal) {
-    HMODULE hNtdll = GetModuleHandleA("ntdll.dll");
-    if (!hNtdll)
-        return FALSE;
-
-    return InstallHookFromModule(hNtdll, szName, pDetour, ppOriginal);
-}
-
-static BOOL InstallHookFromModule(HMODULE hModule, const char* szName, PVOID pDetour, PVOID* ppOriginal) {
-    if (!hModule)
-        return FALSE;
-
-    PVOID pTarget = (PVOID)GetProcAddress(hModule, szName);
-    if (!pTarget)
-        return FALSE;
-
-    HookEntry& entry = g_hooks[g_hookCount];
-    entry.szFunctionName = szName;
-    entry.pOriginalFunc  = pTarget;
-    entry.pDetourFunc    = pDetour;
-
-    entry.pTrampoline = InstallInlineHook(pTarget, pDetour, entry.originalBytes, &entry.dwPatchSize);
-    if (!entry.pTrampoline)
-        return FALSE;
-
-    *ppOriginal = entry.pTrampoline;
-    g_hookCount++;
-    return TRUE;
-}
-
-// ============================================================================
 // Broker Client Implementation
 // ============================================================================
 
@@ -1339,28 +1220,45 @@ NTSTATUS HookBrokerClient::OpenProcess(DWORD dwDesiredAccess, DWORD dwTargetPid,
 // Hook Setup and Teardown
 // ============================================================================
 
+static BOOL CreateHook(const char* szName, LPVOID pDetour, LPVOID* ppOriginal) {
+    HMODULE hNtdll = GetModuleHandleA("ntdll.dll");
+    if (!hNtdll)
+        return FALSE;
+
+    LPVOID pTarget = (LPVOID)GetProcAddress(hNtdll, szName);
+    if (!pTarget)
+        return FALSE;
+
+    return MH_CreateHook(pTarget, pDetour, ppOriginal) == MH_OK;
+}
+
 static void InstallAllHooks() {
+    if (MH_Initialize() != MH_OK)
+        return;
+
     // File operations
-    InstallHook("NtCreateFile",              (PVOID)Hook_NtCreateFile,              (PVOID*)&Original_NtCreateFile);
-    InstallHook("NtOpenFile",               (PVOID)Hook_NtOpenFile,               (PVOID*)&Original_NtOpenFile);
-    InstallHook("NtDeleteFile",             (PVOID)Hook_NtDeleteFile,             (PVOID*)&Original_NtDeleteFile);
-    InstallHook("NtQueryAttributesFile",    (PVOID)Hook_NtQueryAttributesFile,    (PVOID*)&Original_NtQueryAttributesFile);
-    InstallHook("NtQueryFullAttributesFile",(PVOID)Hook_NtQueryFullAttributesFile,(PVOID*)&Original_NtQueryFullAttributesFile);
+    CreateHook("NtCreateFile",               (LPVOID)Hook_NtCreateFile,               (LPVOID*)&Original_NtCreateFile);
+    CreateHook("NtOpenFile",                (LPVOID)Hook_NtOpenFile,                (LPVOID*)&Original_NtOpenFile);
+    CreateHook("NtDeleteFile",              (LPVOID)Hook_NtDeleteFile,              (LPVOID*)&Original_NtDeleteFile);
+    CreateHook("NtQueryAttributesFile",     (LPVOID)Hook_NtQueryAttributesFile,     (LPVOID*)&Original_NtQueryAttributesFile);
+    CreateHook("NtQueryFullAttributesFile", (LPVOID)Hook_NtQueryFullAttributesFile, (LPVOID*)&Original_NtQueryFullAttributesFile);
 
     // Registry operations
-    InstallHook("NtOpenKey",          (PVOID)Hook_NtOpenKey,          (PVOID*)&Original_NtOpenKey);
-    InstallHook("NtOpenKeyEx",        (PVOID)Hook_NtOpenKeyEx,        (PVOID*)&Original_NtOpenKeyEx);
-    InstallHook("NtCreateKey",        (PVOID)Hook_NtCreateKey,        (PVOID*)&Original_NtCreateKey);
-    InstallHook("NtQueryValueKey",    (PVOID)Hook_NtQueryValueKey,    (PVOID*)&Original_NtQueryValueKey);
-    InstallHook("NtSetValueKey",      (PVOID)Hook_NtSetValueKey,      (PVOID*)&Original_NtSetValueKey);
-    InstallHook("NtDeleteKey",        (PVOID)Hook_NtDeleteKey,        (PVOID*)&Original_NtDeleteKey);
+    CreateHook("NtOpenKey",           (LPVOID)Hook_NtOpenKey,           (LPVOID*)&Original_NtOpenKey);
+    CreateHook("NtOpenKeyEx",         (LPVOID)Hook_NtOpenKeyEx,         (LPVOID*)&Original_NtOpenKeyEx);
+    CreateHook("NtCreateKey",         (LPVOID)Hook_NtCreateKey,         (LPVOID*)&Original_NtCreateKey);
+    CreateHook("NtQueryValueKey",     (LPVOID)Hook_NtQueryValueKey,     (LPVOID*)&Original_NtQueryValueKey);
+    CreateHook("NtSetValueKey",       (LPVOID)Hook_NtSetValueKey,       (LPVOID*)&Original_NtSetValueKey);
+    CreateHook("NtDeleteKey",         (LPVOID)Hook_NtDeleteKey,         (LPVOID*)&Original_NtDeleteKey);
 
     // Process operations
-    InstallHook("NtOpenProcess",      (PVOID)Hook_NtOpenProcess,      (PVOID*)&Original_NtOpenProcess);
+    CreateHook("NtOpenProcess",       (LPVOID)Hook_NtOpenProcess,       (LPVOID*)&Original_NtOpenProcess);
 
     // Subprocess propagation
-    InstallHook("NtCreateUserProcess",(PVOID)Hook_NtCreateUserProcess,(PVOID*)&Original_NtCreateUserProcess);
-    InstallHook("NtResumeThread",     (PVOID)Hook_NtResumeThread,     (PVOID*)&Original_NtResumeThread);
+    CreateHook("NtCreateUserProcess", (LPVOID)Hook_NtCreateUserProcess, (LPVOID*)&Original_NtCreateUserProcess);
+    CreateHook("NtResumeThread",      (LPVOID)Hook_NtResumeThread,      (LPVOID*)&Original_NtResumeThread);
+
+    MH_EnableHook(MH_ALL_HOOKS);
 
     // Resolve NtWriteFile/NtReadFile for broker pipe I/O (not hooked)
     // Resolve NtQueryObject for RootDirectory path resolution (not hooked)
@@ -1371,12 +1269,8 @@ static void InstallAllHooks() {
 }
 
 static void RemoveAllHooks() {
-    for (DWORD i = 0; i < g_hookCount; i++) {
-        RemoveInlineHook(g_hooks[i].pOriginalFunc, g_hooks[i].originalBytes, g_hooks[i].dwPatchSize);
-        if (g_hooks[i].pTrampoline)
-            VirtualFree(g_hooks[i].pTrampoline, 0, MEM_RELEASE);
-    }
-    g_hookCount = 0;
+    MH_DisableHook(MH_ALL_HOOKS);
+    MH_Uninitialize();
 }
 
 // ============================================================================
